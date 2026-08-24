@@ -172,7 +172,7 @@ Effort is rough dev-days for one person, including tests.
 ### Phase 1 — Identity (2–3 d) · closes gap 1 · DONE
 
 Implemented in `src/auth-idp.ts` and `src/token-store.ts`, wired in
-`src/main.ts`, with 44 unit tests. What the build confirmed or corrected is
+`src/main.ts`, with 42 unit tests. What the build confirmed or corrected is
 marked inline below.
 
 New `src/auth-idp.ts`:
