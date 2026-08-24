@@ -4,6 +4,7 @@ import { makeDeepLink } from "./deeplink.js";
 import type { VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
 import { type AccessResolver, canWrite, isWritable, describeAccess } from "./policy.js";
+import type { AuditLogger } from "./audit.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -24,6 +25,7 @@ export function registerTools(
     searchIndex: SearchIndex,
     vaultName: string,
     access: ToolAccessOptions,
+    audit?: AuditLogger,
 ) {
     const { resolveAccess, policyActive = false } = access;
     const ceiling = access.ceiling ?? { readOnly: false, writeFolders: null };
@@ -57,9 +59,35 @@ export function registerTools(
         tool.execute = async (args: any, ctx: any) => {
             if (debugLogging) console.log(`[tool] ${tool.name}(${JSON.stringify(args)})`);
             const start = performance.now();
-            const result = await original(args, ctx);
-            if (debugLogging) console.log(`[tool] ${tool.name} → ${((performance.now() - start)).toFixed(0)}ms`);
-            return result;
+            try {
+                const result = await original(args, ctx);
+                // The only outcome we can read from a successful return is a
+                // policy denial, whose message prefix we own (see denyWrite).
+                const denied = typeof result === "string" && result.startsWith("Write access denied:");
+                audit?.record({
+                    tool: tool.name,
+                    args,
+                    session: ctx?.session,
+                    outcome: denied ? "denied" : "ok",
+                    ms: performance.now() - start,
+                    sessionId: ctx?.sessionId,
+                    requestId: ctx?.requestId,
+                });
+                if (debugLogging) console.log(`[tool] ${tool.name} → ${((performance.now() - start)).toFixed(0)}ms`);
+                return result;
+            } catch (err) {
+                audit?.record({
+                    tool: tool.name,
+                    args,
+                    session: ctx?.session,
+                    outcome: "error",
+                    ms: performance.now() - start,
+                    error: (err as Error)?.message,
+                    sessionId: ctx?.sessionId,
+                    requestId: ctx?.requestId,
+                });
+                throw err;
+            }
         };
         return _addTool(tool);
     };

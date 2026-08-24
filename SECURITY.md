@@ -88,6 +88,25 @@ Group membership is read from the ID token claims named by `IDP_GROUPS_CLAIM`.
 Reads are **not** scoped: every authenticated caller can read the whole vault
 (see the vault-isolation note under Known limitations).
 
+### Audit logging
+
+Every tool call emits one structured JSON line (`AUDIT_LOG`, on by default) to
+stdout, and optionally to a `0600` file (`AUDIT_LOG_FILE`). It records the actor
+(email or subject id in IdP mode, `anonymous` otherwise), the tool, the outcome
+(`ok` / `denied` / `error`), timing, and session/request ids. `delete_note` and
+`move_note` are flagged `destructive`.
+
+- **Redaction is by allowlist.** Only known-safe argument keys are logged; note
+  bodies (`content`, `old_text`) are recorded as byte lengths, never text, so a
+  future tool parameter cannot leak content by default.
+- **Paths are logged and are sensitive.** In an E2E vault the paths alone reveal
+  its structure, so the audit stream is confidential and should be access-
+  controlled like the vault itself.
+- **Auditing cannot break a tool call.** A failing sink is caught and logged, not
+  propagated.
+- **It is emitted from the tool wrapper, not fastmcp's `onToolCall`**, because
+  that hook does not receive the caller identity.
+
 ### Brute-force protection
 
 - **Rate limiting with exponential backoff** — after 5 failed password attempts, the server locks out for 5 seconds. Each subsequent lockout doubles: 10s, 20s, 40s, 80s, and so on.

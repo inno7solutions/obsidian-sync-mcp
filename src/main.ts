@@ -13,6 +13,7 @@ import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.
 import { registerTools } from "./tools.js";
 import { parseWriteFolders } from "./write-scope.js";
 import { parsePolicy, makeAccessResolver } from "./policy.js";
+import { makeAuditLogger, type AuditSink } from "./audit.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -334,13 +335,41 @@ if (AUTH_TOKEN) {
     await auth.loadTokens();
 }
 
+// --- Audit logging ---
+// One JSON line per tool call, with the caller's identity. On by default; set
+// AUDIT_LOG=off to disable. Emitted to stdout (a container log pipeline picks it
+// up); AUDIT_LOG_FILE additionally appends to a 0600 file.
+const auditEnabled = (process.env.AUDIT_LOG ?? "on").toLowerCase() !== "off";
+const auditFile = process.env.AUDIT_LOG_FILE?.trim() || undefined;
+let auditSink: AuditSink | undefined;
+if (auditEnabled && auditFile) {
+    const { createWriteStream } = await import("fs");
+    const { chmodSync } = await import("fs");
+    const stream = createWriteStream(auditFile, { flags: "a", mode: 0o600 });
+    try {
+        chmodSync(auditFile, 0o600);
+    } catch {
+        // Best effort: the file may live on a filesystem that ignores chmod.
+    }
+    auditSink = (line: string) => {
+        console.log(line); // still to stdout, so both places have it
+        stream.write(line + "\n");
+    };
+}
+const audit = makeAuditLogger({ vault: VAULT_NAME, enabled: auditEnabled, sink: auditSink });
+if (auditEnabled) {
+    console.log(`Audit logging enabled${auditFile ? ` (stdout + ${auditFile})` : " (stdout)"}.`);
+} else {
+    console.log("Audit logging disabled (AUDIT_LOG=off).");
+}
+
 // --- Tools ---
 const ceiling = { readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS };
 registerTools(server, vault, searchIndex, VAULT_NAME, {
     resolveAccess: makeAccessResolver(POLICY_RULES, ceiling),
     policyActive: POLICY_RULES !== null,
     ceiling,
-});
+}, audit);
 
 // --- Graceful shutdown ---
 async function shutdown() {

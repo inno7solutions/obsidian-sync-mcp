@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerTools } from "./tools.js";
 import { makeAccessResolver, parsePolicy } from "./policy.js";
+import { makeAuditLogger } from "./audit.js";
 
 /** Minimal stand-in for FastMCP that just captures registered tools. */
 function stubServer() {
@@ -56,11 +57,13 @@ const searchIndex = {
     getBacklinks: () => [],
 } as any;
 
-function register(resolveAccess: any, policyActive = true) {
+function register(resolveAccess: any, policyActive = true, vaultOverride?: any) {
     const server = stubServer();
-    const vault = stubVault();
-    registerTools(server as any, vault as any, searchIndex, "MyVault", { resolveAccess, policyActive });
-    return { server, vault };
+    const vault = vaultOverride ?? stubVault();
+    const auditLines: string[] = [];
+    const audit = makeAuditLogger({ vault: "MyVault", enabled: true, sink: (l) => auditLines.push(l) });
+    registerTools(server as any, vault as any, searchIndex, "MyVault", { resolveAccess, policyActive }, audit);
+    return { server, vault, auditLines };
 }
 
 const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"];
@@ -119,6 +122,41 @@ test("the process ceiling overrides a permissive policy", () => {
     for (const t of WRITE_TOOLS) {
         assert.equal(server.tools.get(t).canAccess(editorSession), false, `${t} hidden under read-only ceiling`);
     }
+});
+
+test("audit: a successful write is logged as ok with the actor and no body", async () => {
+    const { server, auditLines } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
+    await server.tools.get("write_note").execute({ path: "Inbox/x.md", content: "secret body" }, { session: editorSession });
+    assert.equal(auditLines.length, 1);
+    const e = JSON.parse(auditLines[0]);
+    assert.equal(e.tool, "write_note");
+    assert.equal(e.outcome, "ok");
+    assert.equal(e.actor, "u1"); // editorSession has no email → sub
+    assert.equal(e.params.content_len, Buffer.byteLength("secret body"));
+    assert.ok(!auditLines[0].includes("secret body"));
+});
+
+test("audit: a policy denial is logged as denied", async () => {
+    const { server, auditLines } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
+    await server.tools.get("write_note").execute({ path: "Projects/x.md", content: "hi" }, { session: editorSession });
+    assert.equal(JSON.parse(auditLines[0]).outcome, "denied");
+});
+
+test("audit: a thrown tool error is logged as error and rethrown", async () => {
+    const throwingVault = { ...stubVault(), async writeNote() { throw new Error("couchdb down"); } };
+    const { server, auditLines } = register(
+        makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }),
+        true,
+        throwingVault,
+    );
+    await assert.rejects(
+        () => server.tools.get("write_note").execute({ path: "Inbox/x.md", content: "hi" }, { session: editorSession }),
+        /couchdb down/,
+    );
+    assert.equal(auditLines.length, 1);
+    const e = JSON.parse(auditLines[0]);
+    assert.equal(e.outcome, "error");
+    assert.equal(e.error, "couchdb down");
 });
 
 test("no policy: canAccess follows the ceiling for everyone", () => {

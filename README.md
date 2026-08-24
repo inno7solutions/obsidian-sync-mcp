@@ -267,6 +267,23 @@ or any account your IdP will issue a token to can reach the vault.
 `IDP_PROVIDER` and `MCP_AUTH_TOKEN` are mutually exclusive; setting both is a
 startup error, since both serve `/oauth/*`.
 
+#### Audit log
+
+Every tool call is logged as one JSON line — who called it, which tool, which
+path, the outcome (`ok` / `denied` / `error`), and how long it took:
+
+```json
+{"ts":"2026-08-24T12:00:00.000Z","evt":"tool_call","vault":"Team","actor":"jane@inno7.com","sub":"...","tool":"delete_note","outcome":"ok","ms":42,"destructive":true,"params":{"path":"Projects/x.md"},"sessionId":"..."}
+```
+
+`actor` is the caller's email (or subject id) in IdP mode, `anonymous` in
+password / no-auth mode. `delete_note` and `move_note` carry `destructive:true`
+for easy alerting. Note **bodies are never logged** — `content` and `old_text`
+appear only as `content_len` / `old_text_len`. Paths *are* logged, and paths are
+sensitive in an E2E vault (they reveal its structure), so treat the audit stream
+as confidential. On by default; `AUDIT_LOG=off` disables it, `AUDIT_LOG_FILE`
+also appends to a file.
+
 #### Per-user write access
 
 By default every authenticated caller has the container's full write scope. Set
@@ -333,6 +350,8 @@ Two things to know before exposing this:
 | `PORT` | Optional | `8787` | HTTP port |
 | `HOST` | Optional | `0.0.0.0` | Bind address (`127.0.0.1` to restrict to localhost) |
 | `MCP_ALLOWED_HOSTS` | Optional | — | Comma-separated extra `Host` values accepted in no-auth mode (e.g. `192.168.1.5,mybox.local`). No-auth mode rejects any other Host to block browser DNS-rebinding; localhost is always allowed. Ignored when `MCP_AUTH_TOKEN` is set. |
+| `AUDIT_LOG` | Optional | `on` | One JSON line per tool call (actor, tool, path, outcome, timing) to stdout. Set to `off` to disable. Note bodies are never logged — only their byte length. |
+| `AUDIT_LOG_FILE` | Optional | — | Additionally append audit lines to this file (created `0600`). Stdout still receives them. |
 | `DATA_DIR` | Optional | `~/.obsidian-mcp` | Directory for persisted data (metadata index, auth tokens) |
 | `LOG_LEVEL` | Optional | — | Set to `debug` for verbose logging (library logs, change feed, index sync) |
 | `MCP_REFRESH_DAYS` | Optional | `14` | Days before auth session expires |

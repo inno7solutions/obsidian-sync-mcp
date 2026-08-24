@@ -3,8 +3,10 @@
 How to take obsidian-sync-mcp from a single-user server to a supportable internal
 multi-user deployment.
 
-Status: plan, not yet implemented. Verified against this repo at `v0.6.3` and
-`fastmcp@3.35.0`.
+Status: Phases 1–3 (the critical path — identity, authorization, audit) are
+built, tested, and on branch `claude/team-vault-deployment-8xkcfb`, pending a
+live-IdP acceptance run. Phases 4–8 remain. Verified against this repo at
+`v0.6.3` and `fastmcp@3.35.0`.
 
 ---
 
@@ -34,9 +36,9 @@ DEPLOYMENT UNIT — repeat per vault, nothing shared between them
 ROADMAP
   critical path — minimum viable team deployment, ship to a pilot group
   ┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
-  │ 1 IDENTITY ✓│───►│ 2 AUTHZ ✓       │───►│ 3 AUDIT     │
+  │ 1 IDENTITY ✓│───►│ 2 AUTHZ ✓       │───►│ 3 AUDIT ✓   │
   │ IdP, no fork│    │ policy+canAccess│    │ who did what│
-  │ built       │    │ built           │    │ 1 d         │
+  │ built       │    │ built           │    │ built       │
   └─────────────┘    └─────────────────┘    └─────────────┘
   ┌─────────────┐  in parallel, ops not code
   │ 4 SECRETS   │  member acct · secret manager · pinned image      1-2 d
@@ -293,7 +295,9 @@ check over the MCP protocol. The one path still needing a live tenant is the
 same as Phase 1's — a real caller with real group claims resolving to the right
 scope; the group-claim wrinkles above are the thing to verify there first.
 
-### Phase 3 — Audit (1 d) · closes gap 3
+### Phase 3 — Audit (1 d) · closes gap 3 · DONE
+
+Implemented in `src/audit.ts`, wired into the `addTool` wrapper, with 25 new unit tests and an end-to-end check. Notes inline.
 
 `fastmcp`'s `onToolCall` hook (`dist/FastMCP.d.ts:541-544`) gives only
 `{toolName, arguments}` — **no identity**, so it is not sufficient. Use the
@@ -320,6 +324,26 @@ New `src/audit.ts` emitting one JSON line per call to stdout:
 
 Acceptance: every tool call by a known actor appears exactly once; no note
 content appears in any log line, asserted by a test.
+
+Built as specified, with these choices worth recording:
+
+- **Hooked in the `addTool` wrapper, confirmed necessary.** fastmcp's
+  `onToolCall` really does receive only `{toolName, arguments}` — no session —
+  so it cannot name the actor. The wrapper has `ctx.session`, `ctx.sessionId`
+  and `ctx.requestId`, and now emits from there.
+- **On by default, not opt-in.** Cheap (one line per call) and the whole point
+  of a team deployment; `AUDIT_LOG=off` disables. Emits to stdout for a
+  container log pipeline, and to a `0600` file if `AUDIT_LOG_FILE` is set.
+- **All tool calls, not only writes.** Reads are logged too, so "who read what"
+  is answerable; `delete_note`/`move_note` carry `destructive:true`.
+- **Redaction by allowlist**, as planned — bodies become `content_len` /
+  `old_text_len`. Verified end-to-end that a note body never reaches the log.
+- **Outcome is derived, not guessed.** `error` from a thrown exception,
+  `denied` from the one denial-message prefix the tool layer owns, else `ok`.
+
+Acceptance met: every tool call by a known actor appears exactly once, and a
+test asserts no note content appears in any line. Actor is `anonymous` until a
+real IdP populates identity — the same live-tenant dependency as Phases 1–2.
 
 ### Phase 4 — Blast radius and secrets (1–2 d) · closes gap 5
 
