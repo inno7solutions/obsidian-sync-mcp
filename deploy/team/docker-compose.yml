@@ -1,0 +1,64 @@
+# Team deployment: CouchDB + MCP server (IdP auth) behind Caddy for TLS.
+#
+# One instance = one vault = one CouchDB database, reachable only over HTTPS at
+# your public BASE_URL. See README "Team mode" and TEAM-DEPLOYMENT-PLAN.md.
+#
+# Setup:
+#   1. Build the image from this branch (the team env vars aren't in the
+#      published image yet):
+#        npm ci && npm run build && docker build -t obsidian-mcp:team .
+#   2. cp deploy/team/.env.example deploy/team/.env  and fill it in.
+#   3. Edit Caddyfile: replace vault.example.com with your hostname.
+#   4. Point DNS at this host; open ports 80 and 443 (80 is needed for the
+#      Let's Encrypt challenge).
+#   5. docker compose -f deploy/team/docker-compose.yml --env-file deploy/team/.env up -d
+#
+# The mcp service publishes no host port — it is reachable only through Caddy.
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # persists issued TLS certs — back this up / don't delete
+      - caddy_config:/config
+    depends_on:
+      - mcp
+
+  mcp:
+    image: obsidian-mcp:team
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      COUCHDB_URL: http://couchdb:5984
+      DATA_DIR: /data
+    volumes:
+      - mcp_data:/data
+    depends_on:
+      - couchdb
+    # No "ports:" — the server is only exposed via Caddy over TLS.
+
+  couchdb:
+    image: couchdb:3
+    restart: unless-stopped
+    environment:
+      COUCHDB_USER: ${COUCHDB_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_PASSWORD:?Set COUCHDB_PASSWORD in .env}
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+      - ../mcp-with-db/couchdb-init.ini:/opt/couchdb/etc/local.d/livesync.ini:ro
+    # Obsidian LiveSync clients need to reach CouchDB directly. Either publish
+    # 5984 here, or (better) proxy it through Caddy on its own hostname — see the
+    # commented block in the Caddyfile.
+    ports:
+      - "5984:5984"
+
+volumes:
+  couchdb_data: {}
+  mcp_data: {}
+  caddy_data: {}
+  caddy_config: {}

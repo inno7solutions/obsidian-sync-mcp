@@ -1,0 +1,15 @@
+# Replace vault.example.com with your real hostname. Caddy fetches and renews a
+# Let's Encrypt certificate automatically on first boot (ports 80 + 443 must be
+# reachable from the internet, and DNS must already point here).
+
+vault.example.com {
+	reverse_proxy mcp:8787
+}
+
+# Optional: expose CouchDB to Obsidian LiveSync clients over TLS too, instead of
+# publishing port 5984. If you enable this, remove the "ports: 5984" mapping from
+# the couchdb service in docker-compose.yml.
+#
+# couch.example.com {
+# 	reverse_proxy couchdb:5984
+# }
