@@ -222,11 +222,11 @@ content appears in any log line, asserted by a test.
 - **Dedicated CouchDB user for MCP** instead of admin. The DB `_security` doc is
   already written by `deploy/mcp-with-db/entrypoint.sh:71-76` (admin + livesync
   member); add an `mcp` user as a member and point `COUCHDB_USER`/
-  `COUCHDB_PASSWORD` at it. *Verify before committing to it*:
-  `src/vault.ts` uses direct doc get/put plus a `_changes` feed with a selector,
-  which a member can do, but confirm nothing in the startup path needs admin
-  (DB creation, design docs, `_local` reads). Test against a fresh DB — this is
-  the one item in the plan with real "might not work" risk.
+  `COUCHDB_PASSWORD` at it. A plain member account suffices — `src/vault.ts` does
+  direct doc get/put plus a selector `_changes` feed, and the database already
+  exists by then. It cannot be narrowed further: CouchDB has no read-only
+  database role, and the salt document may need writing (§4). Still worth a test
+  against a fresh database before committing.
 - Secrets (`COUCHDB_PASSWORD`, `COUCHDB_PASSPHRASE`, `IDP_CLIENT_SECRET`,
   `IDP_*_KEY`) come from a secret manager / Fly secrets, never a committed
   `.env`. `.env.example` gains the new keys with placeholders only.
@@ -309,6 +309,13 @@ fly config per instance, the IdP redirect URI list, CouchDB users and
 already mints a per-vault Setup URI from `hostname`/`username`/`password`/
 `database`/`passphrase` — drive it from the registry instead of by hand.
 
+The CouchDB half is a loop over that registry, where
+`deploy/mcp-with-db/entrypoint.sh` today does exactly one database, one user and
+one name-based `_security` doc: per vault create the database, create
+`livesync-<vault>` and `mcp-<vault>`, and write a role-based `_security` (§4).
+Requires admin credentials, so keep it a provisioning script rather than
+something an instance runs at boot.
+
 Plus: one rollout script that bumps the pinned image across every instance (N
 instances means N chances to forget one), and a per-instance health check.
 Mostly ops glue, no server code.
@@ -371,17 +378,77 @@ Revisit only if instance count becomes unmanageable — call it 10-15 vaults.
    name* on each person's machine. So vault naming is a team-wide onboarding
    rule, not a server detail: pick the names once (`team-knowledge`,
    `client-acme`) and have everyone use them locally.
-3. **CouchDB provisioning is single-vault today.**
-   `deploy/mcp-with-db/entrypoint.sh:71-76` writes `_security` for one database.
-   Per vault we want its own database plus its own `livesync-<vault>` and
-   `mcp-<vault>` users, so a leaked LiveSync credential reaches exactly one
-   vault.
+3. **CouchDB provisioning is single-vault today** — one database, one user, one
+   name-based `_security` doc (`deploy/mcp-with-db/entrypoint.sh:33-76`). Per
+   vault we want its own database and its own `livesync-<vault>` /
+   `mcp-<vault>` accounts, so a leaked sync credential reaches exactly one
+   vault. Detail below.
 4. **Memory and change feeds are per instance.** Each instance holds its own
    in-memory index and its own `_changes` feed, so size per vault rather than per
    team (the 256 MB in `deploy/mcp-only/fly.toml` is a solo-vault figure). Fly's
    `auto_stop_machines = 'suspend'` with `min_machines_running = 0` means idle
    vaults cost almost nothing and a cold start resumes from the persisted
    `since` — so many vaults is cheap as long as few are busy.
+
+### CouchDB: one server, many vault databases — yes; one database, many vaults — no
+
+**One CouchDB hosting every vault as its own database works today, with no code
+change.** `COUCHDB_URL` and `COUCHDB_DATABASE` are separate settings
+(`src/main.ts:29-31`), so N instances point at one server and N databases. This
+is CouchDB's normal multi-tenancy shape and the recommended deployment.
+
+**Two vaults inside one database is not possible**, and won't become possible
+cheaply:
+
+- Document `_id` is the note path — or `f:<hash>` with LiveSync's "Obfuscate
+  properties" — with no vault dimension (`src/id-format.ts`). Two vaults would
+  collide on every identically-named note.
+- The PBKDF2 salt lives in a single per-database local document,
+  `_local/obsidian_livesync_sync_parameters`
+  (`lib/livesync-commonlib/src/common/models/sync.definition.ts:10`). One salt
+  per database means **one E2E crypto domain per database** — vaults sharing a
+  database share the encryption context, which is most of what we wanted
+  separation for.
+- The `_changes` feed has no vault dimension, so every instance would index
+  every vault's changes, and `reconcileObfuscation` (`src/vault.ts:63-80`)
+  samples IDs database-wide — a shared database would classify as `mixed` and
+  warn on every start.
+
+So: **one database per vault, one instance per database.**
+
+### CouchDB facts that shape the provisioning
+
+- **Use roles, not names, in `_security`.** Users are global in `_users`;
+  authorization is per database. `deploy/mcp-with-db/entrypoint.sh:71` writes
+  `members.names` today, which means adding a person edits every vault's
+  `_security`. A per-vault role (`vault-<name>`) inverts that: membership becomes
+  a `_users` document edit.
+- **CouchDB has no read-only database role.** `members` means read *and* write.
+  A read-only MCP instance is therefore enforced only by `READ_ONLY=true` in our
+  process, not by the database. If we want it enforced underneath, that is a
+  `validate_doc_update` design doc rejecting writes from that role — and note it
+  would also block the sync-params write below, so it needs an exemption.
+- **The MCP account needs write access even when the instance is read-only.**
+  The sync-params document holding the salt is created if absent
+  (`SyncParamsHandler`), so a brand-new or rebuilt database needs a writable
+  account on first use. For an existing vault the document is already there.
+  This resolves the open question in Phase 4: a plain member account is enough —
+  no server admin — but it cannot be narrowed below read+write.
+- **Server admins bypass `_security` entirely**, so admin credentials reach every
+  vault on the server. That is the argument for the dedicated per-vault account
+  in Phase 4, and it gets stronger with each vault added. Note the layering that
+  does hold: a CouchDB admin sees ciphertext for every vault (plus paths, unless
+  obfuscation is on); the MCP host is the only place one vault is plaintext.
+- **Creating a database requires a server admin**, so vault creation is a
+  provisioning-time action with admin credentials, never something an instance
+  does for itself.
+- **There are no per-database quotas.** One runaway vault fills the shared disk
+  for all of them. Monitor per-database size; give a high-risk or high-volume
+  vault its own volume or its own server.
+- **Watch `max_dbs_open`** (default 500) and file descriptors: each vault carries
+  its members' LiveSync replications plus one MCP `_changes` feed. Fine at team
+  scale, worth knowing before "a database per person". LiveSync also churns
+  chunk documents, so N vaults means N compaction workloads on one node.
 
 ### Identity and access, per vault
 
