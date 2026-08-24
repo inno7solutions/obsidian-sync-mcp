@@ -267,6 +267,26 @@ or any account your IdP will issue a token to can reach the vault.
 `IDP_PROVIDER` and `MCP_AUTH_TOKEN` are mutually exclusive; setting both is a
 startup error, since both serve `/oauth/*`.
 
+#### Per-user write access
+
+By default every authenticated caller has the container's full write scope. Set
+`POLICY` to grant write access by group instead:
+
+```jsonc
+POLICY='[
+  {"group":"vault-admins","writeFolders":null},        // write anywhere
+  {"group":"vault-editors","writeFolders":["Projects","Inbox"]},
+  {"group":"*","readOnly":true}                          // everyone else: read-only
+]'
+```
+
+Rules are matched in order, first match wins, so list specific groups before the
+`*` catch-all. A caller with no matching rule is read-only (default deny).
+Readers don't just get refused — the write tools are hidden from them entirely.
+`POLICY` is always intersected with the process-wide `READ_ONLY` / `WRITE_FOLDERS`
+ceiling, so those can only ever remove access, never add it. Group membership
+comes from the ID token claims named by `IDP_GROUPS_CLAIM`.
+
 Two things to know before exposing this:
 
 - **Use a dedicated, minimally privileged app registration.** The OAuth proxy
@@ -304,6 +324,7 @@ Two things to know before exposing this:
 | `IDP_REQUIRED_GROUPS` | Optional | — | Comma-separated groups/roles; the caller must be in at least one. Read from the ID token claims named by `IDP_GROUPS_CLAIM`. |
 | `IDP_ALLOWED_DOMAINS` | Optional | — | Comma-separated email domains allowed to connect (e.g. `example.com`). Combine with or use instead of `IDP_REQUIRED_GROUPS`; with neither set, any account your IdP will issue a token to has access. |
 | `IDP_GROUPS_CLAIM` | Optional | `groups,roles` | ID token claims to read group/role membership from. Entra app roles arrive in `roles`; Keycloak/Authentik usually need a mapper to emit `groups`. Note Google does not put Workspace groups in the ID token — use `IDP_ALLOWED_DOMAINS` there. |
+| `POLICY` | Optional | — | JSON array mapping groups to write access, e.g. `[{"group":"vault-admins","writeFolders":null},{"group":"vault-editors","writeFolders":["Projects","Inbox"]},{"group":"*","readOnly":true}]`. First matching rule wins (put specific groups before `*`). `writeFolders:null` means the whole vault; a list scopes writes; `readOnly:true` denies them. No matching rule ⇒ read-only (default deny). Only meaningful with `IDP_PROVIDER`. Always narrowed by the `READ_ONLY` / `WRITE_FOLDERS` ceiling. |
 | `IDP_SCOPES` | Optional | `openid profile email offline_access` (`azure`, `generic`); `openid profile email` (`google`) | Comma-separated scopes requested upstream. Must include `openid` — without an ID token there is no identity. |
 | `IDP_ALLOWED_REDIRECT_URIS` | Optional | hosted Claude callbacks + loopback | Comma-separated redirect URI patterns (`*` wildcards) to *add* for clients whose callback is neither HTTPS nor loopback. Cannot narrow: the underlying check accepts any HTTPS or loopback URI regardless. |
 | `IDP_JWT_SIGNING_KEY` | Optional | derived from `IDP_CLIENT_SECRET` | Signing key for the server's own session tokens. Set explicitly to rotate it independently of the client secret. |

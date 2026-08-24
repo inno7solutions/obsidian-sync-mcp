@@ -3,30 +3,54 @@ import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
 import type { VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
-import { isPathWritable } from "./write-scope.js";
+import { type AccessResolver, canWrite, isWritable, describeAccess } from "./policy.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
 const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as const;
+
+export interface ToolAccessOptions {
+    /** Effective write access for a given session. */
+    resolveAccess: AccessResolver;
+    /** True when a per-caller POLICY is in effect (affects only logging and tool descriptions). */
+    policyActive?: boolean;
+    /** The process ceiling, for the static tool description and startup log. */
+    ceiling?: { readOnly: boolean; writeFolders: string[] | null };
+}
 
 export function registerTools(
     server: FastMCP,
     vault: VaultBackend,
     searchIndex: SearchIndex,
     vaultName: string,
-    readOnly = false,
-    writeFolders: string[] | null = null,
+    access: ToolAccessOptions,
 ) {
-    if (readOnly) {
-        console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
-    } else if (writeFolders) {
-        console.log(`WRITE_FOLDERS: writes restricted to ${writeFolders.map((f) => f + "/").join(", ")}.`);
+    const { resolveAccess, policyActive = false } = access;
+    const ceiling = access.ceiling ?? { readOnly: false, writeFolders: null };
+
+    if (ceiling.readOnly) {
+        console.log(`READ_ONLY mode: write tools disabled for everyone (${WRITE_TOOLS.join(", ")}).`);
+    } else if (ceiling.writeFolders) {
+        console.log(`WRITE_FOLDERS ceiling: writes cannot go outside ${ceiling.writeFolders.map((f) => f + "/").join(", ")}.`);
     }
-    const writeScopeNote = writeFolders
-        ? ` Writes are only allowed inside: ${writeFolders.map((f) => f + "/").join(", ")}.`
-        : "";
-    const denyWrite = (path: string) =>
-        `Write access denied: '${path}' is outside the writable folders (${writeFolders!.map((f) => f + "/").join(", ")}).`;
+    if (policyActive) {
+        console.log("Per-caller POLICY active: write access and writable folders are resolved per identity.");
+    }
+
+    // The tool description is registered once and shown to every caller, so it can
+    // only carry the process ceiling, not the per-caller scope. The per-caller
+    // scope is enforced at call time and reported in denial messages.
+    const writeScopeNote = policyActive
+        ? " Write access is scoped to your identity; a denied write says which folders you may use."
+        : ceiling.writeFolders
+          ? ` Writes are only allowed inside: ${ceiling.writeFolders.map((f) => f + "/").join(", ")}.`
+          : "";
+
+    // canAccess runs once per session: hide write tools entirely from callers who
+    // cannot write anything, so they get MethodNotFound rather than a refusal.
+    const canWriteSession = (session: unknown) => canWrite(resolveAccess(session));
+    const denyWrite = (session: unknown, path: string) =>
+        `Write access denied: '${path}' is outside your writable scope (${describeAccess(resolveAccess(session))}).`;
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
         const original = tool.execute;
@@ -56,16 +80,17 @@ export function registerTools(
         },
     });
 
-    if (!readOnly) server.addTool({
+    server.addTool({
         name: "write_note",
+        canAccess: canWriteSession,
         description:
             "Write or update a note in the Obsidian vault. Creates the note if it doesn't exist. Replaces the entire content if it does — read first if you need to preserve existing content." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
             content: z.string().describe("Full markdown content for the note"),
         }),
-        execute: async ({ path, content }) => {
-            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
+        execute: async ({ path, content }, ctx) => {
+            if (!isWritable(resolveAccess(ctx.session), path)) return denyWrite(ctx.session, path);
             const ok = await vault.writeNote(path, content);
             if (!ok) {
                 return `Failed to write note: ${path}`;
@@ -194,8 +219,9 @@ export function registerTools(
 
 
 
-    if (!readOnly) server.addTool({
+    server.addTool({
         name: "edit_note",
+        canAccess: canWriteSession,
         description:
             "Edit a note without rewriting it. Use 'append' (default) to add content to the end, 'prepend' to add after frontmatter, or 'replace' to swap old_text with new content. For replace, the old_text must match exactly once." + writeScopeNote,
         parameters: z.object({
@@ -210,8 +236,8 @@ export function registerTools(
                 .optional()
                 .describe("Required for replace operation. Exact text to find and replace. Must match exactly once."),
         }),
-        execute: async ({ path, content: newContent, operation, old_text }) => {
-            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
+        execute: async ({ path, content: newContent, operation, old_text }, ctx) => {
+            if (!isWritable(resolveAccess(ctx.session), path)) return denyWrite(ctx.session, path);
             const existing = await vault.readNote(path);
             if (existing === null) {
                 return `Note not found: ${path}`;
@@ -256,32 +282,35 @@ export function registerTools(
         },
     });
 
-    if (!readOnly) server.addTool({
+    server.addTool({
         name: "delete_note",
+        canAccess: canWriteSession,
         description: "Delete a note from the Obsidian vault." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note to delete"),
         }),
-        execute: async ({ path }) => {
-            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
+        execute: async ({ path }, ctx) => {
+            if (!isWritable(resolveAccess(ctx.session), path)) return denyWrite(ctx.session, path);
             const ok = await vault.deleteNote(path);
             if (ok) searchIndex.remove(path);
             return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
         },
     });
 
-    if (!readOnly) server.addTool({
+    server.addTool({
         name: "move_note",
+        canAccess: canWriteSession,
         description:
             "Move or rename a note. Use this to rename a note within the same folder, move it to a different folder, or both at once. Creates destination folders automatically." + writeScopeNote,
         parameters: z.object({
             from: z.string().describe("Current path, e.g. 'daily/old-name.md'"),
             to: z.string().describe("New path, e.g. 'projects/new-name.md'"),
         }),
-        execute: async ({ from, to }) => {
+        execute: async ({ from, to }, ctx) => {
             // Moving out of a folder deletes there; moving in writes there — both ends must be writable.
-            if (!isPathWritable(from, writeFolders)) return denyWrite(from);
-            if (!isPathWritable(to, writeFolders)) return denyWrite(to);
+            const acc = resolveAccess(ctx.session);
+            if (!isWritable(acc, from)) return denyWrite(ctx.session, from);
+            if (!isWritable(acc, to)) return denyWrite(ctx.session, to);
             const content = await vault.readNote(from);
             const ok = await vault.moveNote(from, to);
             if (!ok) {

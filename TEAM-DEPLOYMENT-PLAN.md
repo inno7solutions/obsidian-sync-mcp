@@ -34,9 +34,9 @@ DEPLOYMENT UNIT — repeat per vault, nothing shared between them
 ROADMAP
   critical path — minimum viable team deployment, ship to a pilot group
   ┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
-  │ 1 IDENTITY ✓│───►│ 2 AUTHORIZATION │───►│ 3 AUDIT     │
+  │ 1 IDENTITY ✓│───►│ 2 AUTHZ ✓       │───►│ 3 AUDIT     │
   │ IdP, no fork│    │ policy+canAccess│    │ who did what│
-  │ built       │    │ 2 d             │    │ 1 d         │
+  │ built       │    │ built           │    │ 1 d         │
   └─────────────┘    └─────────────────┘    └─────────────┘
   ┌─────────────┐  in parallel, ops not code
   │ 4 SECRETS   │  member acct · secret manager · pinned image      1-2 d
@@ -239,7 +239,9 @@ misconfiguration fails fast at startup. **The end-to-end login and the
 group-denial path still need a real tenant** — that is the remaining Phase 1
 acceptance work, and it needs decision 1 (§7) settled first.
 
-### Phase 2 — Per-user authorization (2 d) · closes gap 2
+### Phase 2 — Per-user authorization (2 d) · closes gap 2 · DONE
+
+Implemented in `src/policy.ts`, wired into `src/tools.ts` and `src/main.ts`, with 31 new unit tests (policy rules + tool-gating wiring). Notes inline.
 
 New `src/policy.ts`, in the style of the existing `src/write-scope.ts` (pure,
 dependency-free, unit-testable):
@@ -252,18 +254,23 @@ POLICY='[{"group":"vault-editors","writeFolders":["Projects","Inbox"]},
 
 - `parsePolicy(raw)` → rules; `resolvePolicy(identity, rules)` → `{readOnly,
   writeFolders}`. **Default deny for writes**: no matching rule ⇒ read-only.
-- Wire into `registerTools` (`src/tools.ts:12`): two changes.
-  1. `canAccess: (auth) => !resolvePolicy(auth.identity, rules).readOnly` on the
-     four write tools, so readers never see `write_note`, `edit_note`,
-     `delete_note`, `move_note` at all — no tool-call attempts to refuse, no
-     confusing model behaviour.
-  2. Replace the closed-over `writeFolders` in the `isPathWritable` calls
-     (`src/tools.ts:73,220,254,289`) with the per-request value from
-     `ctx.session`. `isPathWritable` itself needs no change — it already takes
-     the folder list as an argument.
+- Wired into `registerTools` as built:
+  1. `canAccess: (session) => canWrite(resolveAccess(session))` on all four write
+     tools, so readers never see them — confirmed end-to-end: `tools/list`
+     returns only the five read tools under a read-only ceiling.
+  2. Each write guard now calls `isWritable(resolveAccess(ctx.session), path)`
+     instead of a closed-over folder list, so the scope is per-caller.
+- **Refinement made during implementation:** `resolveAccess` returns a full
+  `Access` ({readOnly, writeFolders}) rather than just a folder list, and the
+  ceiling is applied by `combineWithCeiling` as a true **intersection** — two
+  disjoint scopes (policy says Inbox, ceiling says Projects) resolve to
+  read-only, not to one side silently winning. `canWrite` drives `canAccess`;
+  `isWritable` drives the per-path check.
 - Env `READ_ONLY` / `WRITE_FOLDERS` stay as the process-wide **ceiling**:
-  effective scope = env ∩ policy. So the container can still be locked down
-  independently of the policy file, and existing deployments behave identically.
+  effective scope = env ∩ policy, so the container can still be locked down
+  independently of the policy file. With no `POLICY` set, every caller gets the
+  ceiling directly — existing deployments behave identically (verified: default
+  no-auth run still lists all nine tools).
 
 The claims-passthrough limitation noted here earlier does not apply: Phase 1
 decodes the ID token directly, so array claims arrive intact and
@@ -278,9 +285,13 @@ groups; Google does **not** put Workspace groups in the ID token at all, so
 Google deployments authorize by `IDP_ALLOWED_DOMAINS` plus per-email policy;
 Keycloak and Authentik need a mapper to emit `groups`.
 
-Acceptance: unit tests for `resolvePolicy` (mirroring
-`src/write-scope.test.ts`); an editor writes only in their folders; a reader's
-`tools/list` contains no write tools; an unmapped user is read-only.
+Acceptance: unit tests for `resolvePolicy` and the resolver; an editor writes
+only in their folders; a reader's `tools/list` contains no write tools; an
+unmapped user is read-only. **Status:** all covered by tests
+(`src/policy.test.ts`, `src/tools.test.ts`) and by an end-to-end `tools/list`
+check over the MCP protocol. The one path still needing a live tenant is the
+same as Phase 1's — a real caller with real group claims resolving to the right
+scope; the group-claim wrinkles above are the thing to verify there first.
 
 ### Phase 3 — Audit (1 d) · closes gap 3
 

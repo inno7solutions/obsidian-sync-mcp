@@ -59,6 +59,35 @@ startup error, because both serve `/oauth/*`.
   back to accepting any HTTPS or loopback URI when no pattern matches. Keep the
   redirect URI allowlist in the IdP tight, since that is the boundary that holds.
 
+### Per-user authorization (team mode)
+
+With `IDP_PROVIDER` set, `POLICY` maps each caller's group/role claims to what
+they may write. It is enforced two ways at once:
+
+- **Tool visibility** — a caller who can write nothing does not see the write
+  tools at all. fastmcp evaluates `canAccess` when the session is created and
+  filters the tool set, so a hidden tool answers `MethodNotFound`, not a refusal.
+  This is genuine enforcement, not cosmetic hiding. Because it is evaluated per
+  session, a policy change takes effect for a caller only on their next session
+  (bounded by the access-token lifetime).
+- **Per-path check** — every write additionally re-checks the caller's folder
+  scope at call time (`isWritable`), so folder scoping does not depend on the
+  tool having been hidden.
+
+Two safety properties hold by construction:
+
+- **Default deny.** A configured policy with no rule matching the caller yields
+  read-only. Writing requires a rule that grants it.
+- **The ceiling only removes access.** Effective write scope is the intersection
+  of the caller's policy and the process-wide `READ_ONLY` / `WRITE_FOLDERS`
+  ceiling, so a locked-down container stays locked down regardless of policy.
+  With no `POLICY` set, every authenticated caller gets the ceiling directly —
+  the pre-existing behavior.
+
+Group membership is read from the ID token claims named by `IDP_GROUPS_CLAIM`.
+Reads are **not** scoped: every authenticated caller can read the whole vault
+(see the vault-isolation note under Known limitations).
+
 ### Brute-force protection
 
 - **Rate limiting with exponential backoff** — after 5 failed password attempts, the server locks out for 5 seconds. Each subsequent lockout doubles: 10s, 20s, 40s, 80s, and so on.

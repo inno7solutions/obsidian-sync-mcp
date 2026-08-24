@@ -12,6 +12,7 @@ import { applyIndexChange } from "./index-sync.js";
 import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.js";
 import { registerTools } from "./tools.js";
 import { parseWriteFolders } from "./write-scope.js";
+import { parsePolicy, makeAccessResolver } from "./policy.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -40,6 +41,19 @@ const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const IDP_PROVIDER = process.env.IDP_PROVIDER?.trim() || undefined;
 const READ_ONLY = process.env.READ_ONLY === "true";
 const WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
+// Per-caller write policy (Phase 2). Parsed early so a malformed policy is fatal
+// at startup rather than silently defaulting to allow. Only meaningful with an
+// identity, i.e. IdP mode.
+let POLICY_RULES;
+try {
+    POLICY_RULES = parsePolicy(process.env.POLICY);
+} catch (err) {
+    console.error(`POLICY configuration error: ${(err as Error).message}`);
+    process.exit(1);
+}
+if (POLICY_RULES && !IDP_PROVIDER) {
+    console.warn("POLICY is set but IDP_PROVIDER is not: without per-caller identity every request resolves against the '*' rule only.");
+}
 
 if (IDP_PROVIDER && AUTH_TOKEN) {
     console.error("Set either IDP_PROVIDER or MCP_AUTH_TOKEN, not both: they both serve /oauth/* and the OAuth discovery documents, so they cannot share a server.");
@@ -321,7 +335,12 @@ if (AUTH_TOKEN) {
 }
 
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS);
+const ceiling = { readOnly: READ_ONLY, writeFolders: WRITE_FOLDERS };
+registerTools(server, vault, searchIndex, VAULT_NAME, {
+    resolveAccess: makeAccessResolver(POLICY_RULES, ceiling),
+    policyActive: POLICY_RULES !== null,
+    ceiling,
+});
 
 // --- Graceful shutdown ---
 async function shutdown() {
