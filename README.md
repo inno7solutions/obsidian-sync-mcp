@@ -236,6 +236,50 @@ For non-OAuth clients (curl, MCP Inspector, custom agents), you can also pass th
 
 Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable for local use or behind a private network.
 
+### Team mode: your own identity provider
+
+For a team, one shared password is the wrong unit. Set `IDP_PROVIDER` instead and
+the server authenticates against your IdP (Entra ID, Google, or any OIDC
+provider such as Keycloak or Authentik), so people sign in as themselves:
+
+```bash
+IDP_PROVIDER=azure \
+IDP_TENANT_ID=<tenant-id> \
+IDP_CLIENT_ID=<app-client-id> \
+IDP_CLIENT_SECRET=<app-client-secret> \
+IDP_REQUIRED_GROUPS=vault-team \
+BASE_URL=https://vault.example.com \
+npx obsidian-sync-mcp
+```
+
+The server presents itself to MCP clients as a standards-compliant
+authorization server — serving the discovery documents they expect and handling
+dynamic client registration — and proxies the actual login upstream to your IdP,
+which does not need to support dynamic registration itself. Register
+`<BASE_URL>/oauth/callback` as a redirect URI in the IdP app.
+
+Each caller's identity (`sub`, `email`, `name`, and group/role claims) is read
+from the OIDC ID token and attached to the session, which is what per-user
+authorization and audit logging build on. Access is denied unless the caller
+satisfies `IDP_REQUIRED_GROUPS` and/or `IDP_ALLOWED_DOMAINS` — set at least one,
+or any account your IdP will issue a token to can reach the vault.
+
+`IDP_PROVIDER` and `MCP_AUTH_TOKEN` are mutually exclusive; setting both is a
+startup error, since both serve `/oauth/*`.
+
+Two things to know before exposing this:
+
+- **Use a dedicated, minimally privileged app registration.** The OAuth proxy
+  answers `/oauth/register` with the upstream `client_id` and `client_secret` —
+  that is how it bridges clients that expect dynamic registration — so treat
+  those credentials as readable by anyone who can reach the port. Grant the app
+  nothing beyond `openid`/`profile`/`email` and no client-credentials grant.
+- **Redirect URIs are constrained by your IdP, not by this server.**
+  `IDP_ALLOWED_REDIRECT_URIS` can only *add* patterns (for clients whose
+  callback is neither HTTPS nor loopback); the underlying check falls back to
+  accepting any HTTPS or loopback URI, so keep the IdP's own redirect URI list
+  tight.
+
 ---
 
 ## Environment variables
@@ -251,7 +295,20 @@ Without `MCP_AUTH_TOKEN`, the server runs without authentication — suitable fo
 | `COUCHDB_OBFUSCATE_PROPERTIES` | CouchDB mode | `false` | Set to `true` if "Obfuscate Properties" is enabled in LiveSync (obfuscates file paths, sizes, dates in the database). For existing vaults the actual setting is auto-detected at startup; this value only decides the format for a brand-new empty database |
 | `VAULT_NAME` | Both | `MyVault` | Vault name (used for deep links and index storage) |
 | `MCP_AUTH_TOKEN` | Optional | — | Password for authentication |
-| `BASE_URL` | Optional | `http://localhost:PORT` | Public URL (for OAuth callbacks when using a tunnel) |
+| `IDP_PROVIDER` | Optional | — | Enables team auth against an identity provider: `azure` (Entra ID), `google`, or `generic` (any OIDC provider — Keycloak, Authentik, Okta). Mutually exclusive with `MCP_AUTH_TOKEN`. `github` is rejected: GitHub OAuth issues no ID token, so there is no identity or group claim to authorize against. |
+| `IDP_CLIENT_ID` | With `IDP_PROVIDER` | — | OAuth client id of the app registration for this server |
+| `IDP_CLIENT_SECRET` | With `IDP_PROVIDER` | — | OAuth client secret. Also the seed for the token-signing and storage-encryption keys, so rotating it ends all live sessions. |
+| `IDP_TENANT_ID` | `azure` only | `common` | Entra tenant id, or `organizations` / `consumers` |
+| `IDP_AUTHORIZATION_ENDPOINT` | `generic` only | — | From your IdP's `/.well-known/openid-configuration` |
+| `IDP_TOKEN_ENDPOINT` | `generic` only | — | From your IdP's `/.well-known/openid-configuration` |
+| `IDP_REQUIRED_GROUPS` | Optional | — | Comma-separated groups/roles; the caller must be in at least one. Read from the ID token claims named by `IDP_GROUPS_CLAIM`. |
+| `IDP_ALLOWED_DOMAINS` | Optional | — | Comma-separated email domains allowed to connect (e.g. `example.com`). Combine with or use instead of `IDP_REQUIRED_GROUPS`; with neither set, any account your IdP will issue a token to has access. |
+| `IDP_GROUPS_CLAIM` | Optional | `groups,roles` | ID token claims to read group/role membership from. Entra app roles arrive in `roles`; Keycloak/Authentik usually need a mapper to emit `groups`. Note Google does not put Workspace groups in the ID token — use `IDP_ALLOWED_DOMAINS` there. |
+| `IDP_SCOPES` | Optional | `openid profile email offline_access` (`azure`, `generic`); `openid profile email` (`google`) | Comma-separated scopes requested upstream. Must include `openid` — without an ID token there is no identity. |
+| `IDP_ALLOWED_REDIRECT_URIS` | Optional | hosted Claude callbacks + loopback | Comma-separated redirect URI patterns (`*` wildcards) to *add* for clients whose callback is neither HTTPS nor loopback. Cannot narrow: the underlying check accepts any HTTPS or loopback URI regardless. |
+| `IDP_JWT_SIGNING_KEY` | Optional | derived from `IDP_CLIENT_SECRET` | Signing key for the server's own session tokens. Set explicitly to rotate it independently of the client secret. |
+| `IDP_ENCRYPTION_KEY` | Optional | derived from `IDP_CLIENT_SECRET` | Encryption key for the persisted OAuth token store. Changing it invalidates stored sessions. |
+| `BASE_URL` | Optional | `http://localhost:PORT` | Public URL (for OAuth callbacks when using a tunnel). In IdP mode it is also the token issuer and audience, so it must be the URL clients actually reach. |
 | `PORT` | Optional | `8787` | HTTP port |
 | `HOST` | Optional | `0.0.0.0` | Bind address (`127.0.0.1` to restrict to localhost) |
 | `MCP_ALLOWED_HOSTS` | Optional | — | Comma-separated extra `Host` values accepted in no-auth mode (e.g. `192.168.1.5,mybox.local`). No-auth mode rejects any other Host to block browser DNS-rebinding; localhost is always allowed. Ignored when `MCP_AUTH_TOKEN` is set. |

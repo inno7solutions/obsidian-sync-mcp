@@ -5,6 +5,8 @@ import { watch, readFileSync, statSync } from "fs";
 import { stat } from "fs/promises";
 import { setGlobalLogFunction, LEVEL_INFO } from "octagonal-wheels/common/logger";
 import { mountPasswordAuth } from "./auth.js";
+import { parseIdpConfig, createIdpAuth, describeIdpConfig, IDP_STARTUP_NOTES } from "./auth-idp.js";
+import { FileTokenStorage } from "./token-store.js";
 import { SearchIndex } from "./search.js";
 import { applyIndexChange } from "./index-sync.js";
 import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.js";
@@ -35,8 +37,14 @@ const VAULT_NAME = process.env.VAULT_NAME ?? "MyVault";
 const PORT = parseInt(process.env.PORT ?? "8787");
 const BASE_URL = process.env.BASE_URL ?? `http://localhost:${PORT}`;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
+const IDP_PROVIDER = process.env.IDP_PROVIDER?.trim() || undefined;
 const READ_ONLY = process.env.READ_ONLY === "true";
 const WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
+
+if (IDP_PROVIDER && AUTH_TOKEN) {
+    console.error("Set either IDP_PROVIDER or MCP_AUTH_TOKEN, not both: they both serve /oauth/* and the OAuth discovery documents, so they cannot share a server.");
+    process.exit(1);
+}
 
 // Extra instructions appended to the MCP `instructions` string.
 // File wins if both are set (loud warning); missing file is fatal.
@@ -230,7 +238,36 @@ const serverOptions: ConstructorParameters<typeof FastMCP>[0] = {
 import type { AuthHandle } from "./auth.js";
 let auth: AuthHandle | null = null;
 
-if (AUTH_TOKEN) {
+let idpTokenStore: FileTokenStorage | null = null;
+
+if (IDP_PROVIDER) {
+    // Real identity: OAuth against an external IdP. fastmcp's provider runs the
+    // OAuth proxy (discovery documents, DCR, /oauth/* routes); our authenticate
+    // adds the identity and the group/domain gate on top. Setting both `auth`
+    // and `authenticate` is deliberate — fastmcp prefers ours for authentication
+    // while still installing the provider's OAuth surface.
+    let idpAuth;
+    try {
+        const cfg = parseIdpConfig(process.env);
+        idpTokenStore = new FileTokenStorage(join(dataDir, "oauth-store.json"));
+        const restored = await idpTokenStore.load();
+        idpAuth = createIdpAuth(cfg, BASE_URL, idpTokenStore);
+        console.log(`Auth enabled (IdP OAuth): ${describeIdpConfig(cfg)}.`);
+        if (restored) console.log(`Restored ${idpTokenStore.size} persisted OAuth entries — existing sessions survive this restart.`);
+        for (const note of IDP_STARTUP_NOTES) console.warn(note);
+        if (cfg.requiredGroups.length === 0 && cfg.allowedDomains.length === 0) {
+            console.warn("WARNING: neither IDP_REQUIRED_GROUPS nor IDP_ALLOWED_DOMAINS is set — anyone your IdP will issue a token to gets vault access.");
+        }
+    } catch (err) {
+        console.error(`IdP auth configuration error: ${(err as Error).message}`);
+        process.exit(1);
+    }
+    serverOptions.auth = idpAuth.provider as NonNullable<typeof serverOptions.auth>;
+    serverOptions.authenticate = idpAuth.authenticate;
+    if (!BASE_URL.startsWith("https://") && !BASE_URL.includes("localhost")) {
+        console.warn("WARNING: BASE_URL is not HTTPS. OAuth tokens will be sent in cleartext.");
+    }
+} else if (AUTH_TOKEN) {
     serverOptions.authenticate = async (req: import("http").IncomingMessage) => {
         const header = req.headers["authorization"];
         // Accept static Bearer token (for curl, MCP Inspector, custom agents)
@@ -292,6 +329,7 @@ async function shutdown() {
     if (fsWatcher) fsWatcher.close();
     await searchIndex.saveToDisk();
     if (auth) await auth.saveTokens();
+    if (idpTokenStore) await idpTokenStore.flush();
     await vault.close();
     process.exit(0);
 }
@@ -305,6 +343,7 @@ setInterval(async () => {
         auth.cleanup();
         await auth.saveTokens();
     }
+    if (idpTokenStore) await idpTokenStore.cleanup();
 }, 5 * 60 * 1000).unref();
 
 // --- Start server ---

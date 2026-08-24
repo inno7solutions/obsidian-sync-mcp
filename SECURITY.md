@@ -18,6 +18,47 @@ The server implements a self-contained OAuth 2.1 authorization server with PKCE.
 - **No auth mode** — when `MCP_AUTH_TOKEN` is not set, the server runs without authentication. Intended for local testing or use behind a private network.
 - **Browser-attack protection (no auth mode)** — with no token, the server validates both the HTTP `Host` and `Origin` headers and rejects any request whose host/origin is not `localhost`/`127.0.0.1`/`::1` (extend with `MCP_ALLOWED_HOSTS`, comma-separated). The `Host` check blocks DNS rebinding (CWE-350) — a loopback bind alone does **not** stop this, since the browser sends the attacker's hostname in `Host`. The `Origin` check blocks the simpler variant where a page directly fetches `http://127.0.0.1:<port>/mcp`: that request has a genuine loopback `Host` but carries a cross-origin `Origin`, and the transport's wildcard CORS would otherwise expose the response. Non-browser MCP clients (CLI, desktop apps) send no `Origin`, so they are unaffected. These checks block *browser*-delivered attacks only: a direct non-browser network client can still forge both headers, so on an untrusted network set `MCP_AUTH_TOKEN`. When a token is set, no host/origin check is needed — a bearer token is not attached by browsers.
 
+### Identity-provider OAuth (team mode)
+
+Setting `IDP_PROVIDER` replaces the shared password with OAuth against an
+external identity provider (Entra ID, Google, or any OIDC provider). The server
+runs an OAuth proxy: to MCP clients it is a standards-compliant authorization
+server with dynamic client registration, while the actual login is delegated
+upstream. Mutually exclusive with `MCP_AUTH_TOKEN` — setting both is a fatal
+startup error, because both serve `/oauth/*`.
+
+- **Identity per caller** — `sub`, `email`, `name` and group/role claims are read
+  from the OIDC ID token and attached to the session. The ID token is decoded
+  without signature verification, which is sound only because it never passes
+  through the caller: the client holds a server-issued token, and the ID token is
+  read from server-side storage having arrived over TLS from the IdP's token
+  endpoint. Disabling fastmcp's token swap would invalidate that reasoning.
+- **Access gate** — `IDP_REQUIRED_GROUPS` (any-of) and `IDP_ALLOWED_DOMAINS`
+  (email domain) are enforced on every authentication, and denials are logged
+  with the subject and reason. With neither set, any account the IdP will issue a
+  token for has full vault access; the server warns about this at startup.
+- **Token issuer and audience are `BASE_URL`** — tokens minted by one instance are
+  rejected by another with a different `BASE_URL`, so separate vaults on separate
+  hostnames cannot borrow each other's sessions.
+- **Session keys are derived from `IDP_CLIENT_SECRET`** unless
+  `IDP_JWT_SIGNING_KEY` / `IDP_ENCRYPTION_KEY` are set. This is deliberate:
+  auto-generated keys would rotate on every restart, invalidating all sessions
+  and the persisted token store. Rotating the client secret intentionally ends
+  every session.
+- **Persisted token store** — OAuth state is written to `DATA_DIR/oauth-store.json`
+  with `0600` permissions, so restarts and deploys do not log the team out. The
+  values are encrypted by fastmcp's storage layer before they reach the file.
+- **The IdP client credentials are retrievable** — `/oauth/register` answers any
+  caller with the upstream `client_id` and `client_secret`, which is how the
+  proxy serves clients that expect dynamic registration. Use a dedicated app
+  registration with no permissions beyond `openid`/`profile`/`email` and no
+  client-credentials grant, and treat the secret as exposed to anyone who can
+  reach the port.
+- **Redirect URIs are not restricted by this server** —
+  `IDP_ALLOWED_REDIRECT_URIS` can only add patterns; the underlying check falls
+  back to accepting any HTTPS or loopback URI when no pattern matches. Keep the
+  redirect URI allowlist in the IdP tight, since that is the boundary that holds.
+
 ### Brute-force protection
 
 - **Rate limiting with exponential backoff** — after 5 failed password attempts, the server locks out for 5 seconds. Each subsequent lockout doubles: 10s, 20s, 40s, 80s, and so on.

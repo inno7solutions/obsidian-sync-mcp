@@ -34,9 +34,9 @@ DEPLOYMENT UNIT — repeat per vault, nothing shared between them
 ROADMAP
   critical path — minimum viable team deployment, ship to a pilot group
   ┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
-  │ 1 IDENTITY  │───►│ 2 AUTHORIZATION │───►│ 3 AUDIT     │
+  │ 1 IDENTITY ✓│───►│ 2 AUTHORIZATION │───►│ 3 AUDIT     │
   │ IdP, no fork│    │ policy+canAccess│    │ who did what│
-  │ 2-3 d       │    │ 2 d             │    │ 1 d         │
+  │ built       │    │ 2 d             │    │ 1 d         │
   └─────────────┘    └─────────────────┘    └─────────────┘
   ┌─────────────┐  in parallel, ops not code
   │ 4 SECRETS   │  member acct · secret manager · pinned image      1-2 d
@@ -169,7 +169,11 @@ see §4.
 
 Effort is rough dev-days for one person, including tests.
 
-### Phase 1 — Identity (2–3 d) · closes gap 1
+### Phase 1 — Identity (2–3 d) · closes gap 1 · DONE
+
+Implemented in `src/auth-idp.ts` and `src/token-store.ts`, wired in
+`src/main.ts`, with 44 unit tests. What the build confirmed or corrected is
+marked inline below.
 
 New `src/auth-idp.ts`:
 
@@ -177,9 +181,14 @@ New `src/auth-idp.ts`:
   `IDP_CLIENT_ID`, `IDP_CLIENT_SECRET`, `IDP_TENANT_ID` (azure),
   `IDP_AUTHORIZATION_ENDPOINT` + `IDP_TOKEN_ENDPOINT` (generic — Authentik,
   Keycloak), `IDP_SCOPES`.
-- Set `allowedRedirectUriPatterns` explicitly. The provider default is
-  `["http://localhost:*", "https://*"]`, i.e. any HTTPS redirect URI — narrow it
-  to Claude's documented callbacks plus our own.
+- ~~Set `allowedRedirectUriPatterns` explicitly to narrow the default of any
+  HTTPS URI.~~ **Corrected: this option cannot narrow anything.**
+  `OAuthProxy.validateRedirectUri()` tries the configured patterns and then
+  falls back to `protocol === "https:" || loopback`, so any HTTPS or loopback
+  redirect URI is accepted whatever the list says — verified by registering
+  `https://evil.example/cb` successfully. The list can only *widen* (custom
+  schemes). The redirect URI allowlist in the IdP is the boundary that holds;
+  worth reporting upstream.
 - Set `jwtSigningKey` and `encryptionKey` from secrets, not auto-generated:
   auto-generated keys rotate on restart and invalidate every live session.
 - Export an `authenticate` that wraps `provider.authenticate(req)`, decodes
@@ -189,7 +198,18 @@ New `src/auth-idp.ts`:
   comes from server-side storage, never from the caller. Comment that constraint
   in the code — it stops being true if token swap is ever disabled.
 - Throw the same 401 + `WWW-Authenticate: Bearer resource_metadata=...` shape
-  `src/main.ts:246-249` already uses, so strict clients still discover us.
+  `src/main.ts` already uses in password mode, so strict clients still discover
+  us.
+- **Added during implementation:** a file-backed `TokenStorage`
+  (`src/token-store.ts`). fastmcp defaults to in-memory storage, which would log
+  the whole team out on every restart and deploy — and the acceptance criterion
+  below is that a restart does not force re-auth. Same 4-method contract, same
+  TTL semantics, `0600` file, values already encrypted by fastmcp's storage
+  layer. This is also the seam Phase 7 swaps for Redis to scale out.
+- **Added during implementation:** an access gate. `IDP_REQUIRED_GROUPS`
+  (any-of) and `IDP_ALLOWED_DOMAINS` (email domain), enforced per
+  authentication with denials logged, plus a startup warning when neither is
+  set. Without it, "authenticated" would mean "anyone in the tenant".
 
 In `src/main.ts`, add a third auth mode alongside the existing two:
 
@@ -210,6 +230,14 @@ registration — one per instance if we ever run several.
 Acceptance: a team member connects Claude, is redirected to the corporate IdP,
 lands back authenticated; a user outside the required group cannot obtain a
 usable session; restart does not force re-auth.
+
+Status: unit tests cover config parsing, ID-token decoding, identity extraction
+and the gate; a local smoke test confirms both discovery documents advertise our
+`BASE_URL`, that `/oauth/authorize` hands off upstream to the configured IdP,
+that `/mcp` answers 401 with the resource-metadata pointer, and that every
+misconfiguration fails fast at startup. **The end-to-end login and the
+group-denial path still need a real tenant** — that is the remaining Phase 1
+acceptance work, and it needs decision 1 (§7) settled first.
 
 ### Phase 2 — Per-user authorization (2 d) · closes gap 2
 
@@ -237,11 +265,18 @@ POLICY='[{"group":"vault-editors","writeFolders":["Projects","Inbox"]},
   effective scope = env ∩ policy. So the container can still be locked down
   independently of the policy file, and existing deployments behave identically.
 
-Note the `groups` claim is an array, and claims passthrough only carries
-primitives unless `allowComplexClaims` is set
-(`dist/OAuthProvider-*.d.ts:66`). Either set that, or configure the IdP to emit
-roles as a space-delimited string / scopes. Verify against the real tenant early
-— this is the most likely place for a surprise.
+The claims-passthrough limitation noted here earlier does not apply: Phase 1
+decodes the ID token directly, so array claims arrive intact and
+`allowComplexClaims` is irrelevant. `IDP_GROUPS_CLAIM` selects which claims to
+read, and `toStringList` already accepts arrays, space-delimited and
+comma-delimited values.
+
+The IdP-side wrinkle is real, though, and needs checking against the actual
+tenant early: Entra needs the `groups` optional claim configured, or app roles
+(cleaner — names, not GUIDs, in `roles`), and overflows to `hasgroups` past ~200
+groups; Google does **not** put Workspace groups in the ID token at all, so
+Google deployments authorize by `IDP_ALLOWED_DOMAINS` plus per-email policy;
+Keycloak and Authentik need a mapper to emit `groups`.
 
 Acceptance: unit tests for `resolvePolicy` (mirroring
 `src/write-scope.test.ts`); an editor writes only in their folders; a reader's
@@ -288,6 +323,13 @@ content appears in any log line, asserted by a test.
 - Secrets (`COUCHDB_PASSWORD`, `COUCHDB_PASSPHRASE`, `IDP_CLIENT_SECRET`,
   `IDP_*_KEY`) come from a secret manager / Fly secrets, never a committed
   `.env`. `.env.example` gains the new keys with placeholders only.
+- **A dedicated, minimally privileged IdP app registration per vault is not
+  optional.** Found while smoke-testing Phase 1: `/oauth/register` answers any
+  caller with the upstream `client_id` and `client_secret` — that is how fastmcp
+  bridges clients expecting dynamic registration — so those credentials are
+  recoverable by anyone who can reach the port. Grant the app nothing beyond
+  `openid`/`profile`/`email`, no client-credentials grant, and rotate on
+  exposure (which also ends all sessions, since the session keys derive from it).
 - The MCP host is the one place the vault exists decrypted, and `DATA_DIR`
   holds the index (AES-256-GCM with the passphrase) and OAuth tokens
   (`0600`). No shared shell on that host; restrict who can `exec` into the
