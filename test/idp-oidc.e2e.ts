@@ -114,6 +114,8 @@ before(async () => {
             IDP_TOKEN_ENDPOINT: `${STUB}/token`,
             IDP_REQUIRED_GROUPS: "vault-team",
             IDP_GROUPS_CLAIM: "groups",
+            ADMIN_TOKEN: "e2e-admin-token-0123456789",
+            ADMIN_EMAIL: "ops@inno7.com",
             IDP_ALLOWED_REDIRECT_URIS: "http://localhost:*",
             POLICY: JSON.stringify([
                 { group: "vault-editors", writeFolders: ["Inbox"] },
@@ -268,6 +270,24 @@ test("outsider: not in the required group, so cannot reach the tools at all", as
     const token = await login(OUTSIDER);
     const res = await mcpCall(token, "tools/list");
     assert.equal(res.httpStatus, 403, "a caller outside vault-team should be forbidden");
+});
+
+test("admin fallback: the static token authenticates without OAuth and can write anywhere", async () => {
+    // No login flow at all — just the bearer token, as a script or curl would use it.
+    const token = "e2e-admin-token-0123456789";
+
+    const list = await mcpCall(token, "tools/list");
+    const names = list.tools.map((t: any) => t.name);
+    assert.ok(names.includes("write_note"), "admin sees write tools");
+
+    // Admin bypasses POLICY: can write outside Inbox, where even the editor was denied.
+    const ok = await mcpCall(token, "tools/call", { name: "write_note", arguments: { path: "Projects/admin.md", content: "by admin" } });
+    assert.match(ok.content[0].text, /Note saved/, "admin can write outside the editor's folder");
+});
+
+test("admin fallback: a wrong static token is rejected", async () => {
+    const res = await mcpCall("not-the-admin-token", "tools/list");
+    assert.equal(res.httpStatus, 401, "an unknown bearer that is neither an IdP token nor the admin token is unauthorized");
 });
 
 test("audit log names the real actor and never records note bodies", async () => {

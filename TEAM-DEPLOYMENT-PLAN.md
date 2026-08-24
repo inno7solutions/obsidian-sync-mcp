@@ -244,6 +244,15 @@ group-denial path are now verified too** — `npm run test:idp` drives the full
 DCR → authorize → consent → upstream → callback → token flow against a local
 OIDC provider and asserts an out-of-group caller gets 403.
 
+**Added after the critical path: a local admin fallback.** `ADMIN_TOKEN` is a
+static bearer that authenticates as a fixed admin identity, usable alongside the
+IdP (it mounts no routes, so unlike `MCP_AUTH_TOKEN` it does not collide with the
+OAuth proxy). It is break-glass access for when the IdP is down and a path for
+non-interactive clients. Implemented in `src/auth-admin.ts`; the admin bypasses
+per-caller POLICY but not the ceiling, and is attributed in the audit log. Ten
+unit tests plus two e2e cases (`npm run test:idp`) — admin writes outside the
+editor's folder, and a wrong static token is 401.
+
 ### Phase 2 — Per-user authorization (2 d) · closes gap 2 · DONE
 
 Implemented in `src/policy.ts`, wired into `src/tools.ts` and `src/main.ts`, with 31 new unit tests (policy rules + tool-gating wiring). Notes inline.

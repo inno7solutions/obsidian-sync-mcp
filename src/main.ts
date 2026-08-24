@@ -6,6 +6,7 @@ import { stat } from "fs/promises";
 import { setGlobalLogFunction, LEVEL_INFO } from "octagonal-wheels/common/logger";
 import { mountPasswordAuth } from "./auth.js";
 import { parseIdpConfig, createIdpAuth, describeIdpConfig, IDP_STARTUP_NOTES } from "./auth-idp.js";
+import { parseAdminConfig, adminSessionFor } from "./auth-admin.js";
 import { FileTokenStorage } from "./token-store.js";
 import { SearchIndex } from "./search.js";
 import { applyIndexChange } from "./index-sync.js";
@@ -325,6 +326,22 @@ if (IDP_PROVIDER) {
     if (host === "0.0.0.0") {
         console.warn("WARNING: No authentication and listening on all interfaces. Browser attacks (DNS rebinding and cross-origin fetch) are blocked by the Host/Origin checks, but any non-browser client that can reach this port has full vault access. Set MCP_AUTH_TOKEN, or HOST=127.0.0.1 to bind to loopback only.");
     }
+}
+
+// --- Local admin fallback ---
+// A static bearer token that authenticates as a fixed admin identity, usable
+// alongside any mode above. Wraps the active authenticate: an admin bearer wins,
+// everything else falls through to the mode's own authenticator.
+const adminConfig = parseAdminConfig(process.env);
+if (adminConfig) {
+    const base = serverOptions.authenticate;
+    serverOptions.authenticate = async (req: import("http").IncomingMessage) => {
+        const admin = adminSessionFor(req.headers["authorization"], adminConfig);
+        if (admin) return admin;
+        if (!base) return { authenticated: true }; // no other mode configured
+        return base(req);
+    };
+    console.log(`Local admin fallback enabled (ADMIN_TOKEN) — actor: ${adminConfig.identity.email}, groups: ${adminConfig.identity.groups.join(",")}.`);
 }
 
 const server = new FastMCP(serverOptions);

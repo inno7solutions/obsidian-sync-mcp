@@ -59,6 +59,24 @@ startup error, because both serve `/oauth/*`.
   back to accepting any HTTPS or loopback URI when no pattern matches. Keep the
   redirect URI allowlist in the IdP tight, since that is the boundary that holds.
 
+### Local admin fallback
+
+`ADMIN_TOKEN` defines a static bearer that authenticates as a fixed admin
+identity, usable *alongside* `IDP_PROVIDER` (it mounts no routes, so it does not
+collide with the OAuth proxy the way `MCP_AUTH_TOKEN` would). It exists for
+break-glass access when the IdP is unavailable and for non-interactive clients.
+
+- **Constant-time comparison** against `Bearer <ADMIN_TOKEN>`, with a length
+  guard, so the check is not a timing oracle.
+- **Carries an identity**, so admin actions are attributed in the audit log
+  (`ADMIN_EMAIL`), not anonymous.
+- **Bypasses per-caller POLICY** (writes anywhere) but **not** the process-wide
+  `READ_ONLY` / `WRITE_FOLDERS` ceiling — a locked-down container stays locked
+  down.
+- **It is a shared secret with full write access.** Treat it like a root
+  password: long and random, delivered via the secret manager, rotated on
+  exposure, and ideally used only when the IdP path is unavailable.
+
 ### Per-user authorization (team mode)
 
 With `IDP_PROVIDER` set, `POLICY` maps each caller's group/role claims to what

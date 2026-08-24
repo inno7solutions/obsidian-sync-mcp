@@ -265,7 +265,29 @@ satisfies `IDP_REQUIRED_GROUPS` and/or `IDP_ALLOWED_DOMAINS` — set at least on
 or any account your IdP will issue a token to can reach the vault.
 
 `IDP_PROVIDER` and `MCP_AUTH_TOKEN` are mutually exclusive; setting both is a
-startup error, since both serve `/oauth/*`.
+startup error, since both serve `/oauth/*`. For a break-glass admin that works
+*with* the IdP, use `ADMIN_TOKEN` instead (below) — it mounts no routes, so it
+composes with any mode.
+
+#### Local admin fallback
+
+Set `ADMIN_TOKEN` to a long random secret and any client presenting
+`Authorization: Bearer <ADMIN_TOKEN>` is authenticated as a fixed admin
+identity — no OAuth, no browser. It works alongside `IDP_PROVIDER`, so it is the
+way in when the IdP is unavailable, and the way for non-interactive clients
+(curl, scripts, CI) to reach the vault:
+
+```bash
+IDP_PROVIDER=generic ... \
+ADMIN_TOKEN=$(openssl rand -hex 32) \
+ADMIN_EMAIL=ops@example.com \
+npx obsidian-sync-mcp
+```
+
+The admin bypasses per-caller `POLICY` (can write anywhere) but **not** the
+process-wide `READ_ONLY` / `WRITE_FOLDERS` ceiling, and admin actions are
+attributed to `ADMIN_EMAIL` in the audit log. Treat the token like a root
+password: long, secret, rotated on exposure.
 
 #### Generic OIDC setup (Keycloak, Authentik, Okta, …)
 
@@ -391,6 +413,10 @@ Two things to know before exposing this:
 | `IDP_REQUIRED_GROUPS` | Optional | — | Comma-separated groups/roles; the caller must be in at least one. Read from the ID token claims named by `IDP_GROUPS_CLAIM`. |
 | `IDP_ALLOWED_DOMAINS` | Optional | — | Comma-separated email domains allowed to connect (e.g. `example.com`). Combine with or use instead of `IDP_REQUIRED_GROUPS`; with neither set, any account your IdP will issue a token to has access. |
 | `IDP_GROUPS_CLAIM` | Optional | `groups,roles` | ID token claims to read group/role membership from. Entra app roles arrive in `roles`; Keycloak/Authentik usually need a mapper to emit `groups`. Note Google does not put Workspace groups in the ID token — use `IDP_ALLOWED_DOMAINS` there. |
+| `ADMIN_TOKEN` | Optional | — | Static bearer token for a break-glass **local admin**, usable alongside `IDP_PROVIDER` (unlike `MCP_AUTH_TOKEN`, it mounts no routes). A client sending `Authorization: Bearer <ADMIN_TOKEN>` is authenticated as a fixed admin identity with no OAuth round-trip — for when the IdP is down, or for scripts/CI. Bypasses `POLICY` (writes anywhere) but not the `READ_ONLY` / `WRITE_FOLDERS` ceiling. Use a long random secret. |
+| `ADMIN_EMAIL` | Optional | `admin@local` | Actor recorded in the audit log for admin-token calls. |
+| `ADMIN_GROUPS` | Optional | `vault-admins` | Groups on the synthesized admin identity (audit + any group-based logic). |
+| `ADMIN_SUB` | Optional | `admin` | Subject id on the synthesized admin identity. |
 | `POLICY` | Optional | — | JSON array mapping groups to write access, e.g. `[{"group":"vault-admins","writeFolders":null},{"group":"vault-editors","writeFolders":["Projects","Inbox"]},{"group":"*","readOnly":true}]`. First matching rule wins (put specific groups before `*`). `writeFolders:null` means the whole vault; a list scopes writes; `readOnly:true` denies them. No matching rule ⇒ read-only (default deny). Only meaningful with `IDP_PROVIDER`. Always narrowed by the `READ_ONLY` / `WRITE_FOLDERS` ceiling. |
 | `IDP_SCOPES` | Optional | `openid profile email offline_access` (`azure`, `generic`); `openid profile email` (`google`) | Comma-separated scopes requested upstream. Must include `openid` — without an ID token there is no identity. |
 | `IDP_ALLOWED_REDIRECT_URIS` | Optional | hosted Claude callbacks + loopback | Comma-separated redirect URI patterns (`*` wildcards) to *add* for clients whose callback is neither HTTPS nor loopback. Cannot narrow: the underlying check accepts any HTTPS or loopback URI regardless. |

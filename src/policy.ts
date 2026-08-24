@@ -21,6 +21,7 @@
 
 import { isPathWritable } from "./write-scope.js";
 import type { IdpIdentity } from "./auth-idp.js";
+import { isAdminSession } from "./auth-admin.js";
 
 /**
  * Effective write access for one caller.
@@ -200,11 +201,15 @@ function sessionIdentity(session: unknown): IdpIdentity | undefined {
  * narrowed by the ceiling.
  */
 export function makeAccessResolver(rules: AccessRule[] | null, ceiling: Ceiling): AccessResolver {
-    if (rules === null) {
-        const shared: Access = { readOnly: ceiling.readOnly, writeFolders: ceiling.writeFolders };
-        return () => shared;
-    }
-    return (session: unknown) => combineWithCeiling(resolvePolicy(sessionIdentity(session), rules), ceiling);
+    // Full write access, subject only to the ceiling — what an admin resolves to.
+    const unrestricted: Access = { readOnly: false, writeFolders: null };
+    const shared: Access | null = rules === null ? { readOnly: ceiling.readOnly, writeFolders: ceiling.writeFolders } : null;
+    return (session: unknown) => {
+        // The local admin bypasses POLICY entirely, but never the ceiling.
+        if (isAdminSession(session)) return combineWithCeiling(unrestricted, ceiling);
+        if (shared) return shared;
+        return combineWithCeiling(resolvePolicy(sessionIdentity(session), rules!), ceiling);
+    };
 }
 
 /** Short human-readable description of an access value, for denial messages. */

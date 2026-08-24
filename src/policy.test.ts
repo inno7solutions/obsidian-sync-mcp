@@ -194,6 +194,29 @@ test("makeAccessResolver: resolves per identity when a policy is set", () => {
     assert.equal(canWrite(resolve(undefined)), false); // no identity → catch-all/deny
 });
 
+const adminSession = { authenticated: true, admin: true, identity: { sub: "admin", groups: ["vault-admins"] } };
+
+test("makeAccessResolver: an admin session bypasses POLICY (full write)", () => {
+    // Policy would make this identity read-only via the catch-all, but admin wins.
+    const resolve = makeAccessResolver(RULES, { readOnly: false, writeFolders: null });
+    assert.deepEqual(resolve(adminSession), { readOnly: false, writeFolders: null });
+    assert.equal(canWrite(resolve(adminSession)), true);
+});
+
+test("makeAccessResolver: admin bypasses POLICY even with no policy set", () => {
+    const resolve = makeAccessResolver(null, { readOnly: false, writeFolders: null });
+    assert.equal(canWrite(resolve(adminSession)), true);
+});
+
+test("makeAccessResolver: admin does NOT bypass the ceiling", () => {
+    // A read-only container stays read-only, even for the admin.
+    const ro = makeAccessResolver(RULES, { readOnly: true, writeFolders: null });
+    assert.equal(canWrite(ro(adminSession)), false);
+    // A folder ceiling still pins the admin.
+    const scoped = makeAccessResolver(null, { readOnly: false, writeFolders: ["Ops"] });
+    assert.deepEqual(scoped(adminSession), { readOnly: false, writeFolders: ["Ops"] });
+});
+
 test("makeAccessResolver: policy is still narrowed by the ceiling", () => {
     const resolve = makeAccessResolver(RULES, { readOnly: false, writeFolders: ["Projects"] });
     // Admin is unrestricted by policy but the ceiling pins them to Projects.
