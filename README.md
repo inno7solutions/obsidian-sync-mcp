@@ -267,6 +267,56 @@ or any account your IdP will issue a token to can reach the vault.
 `IDP_PROVIDER` and `MCP_AUTH_TOKEN` are mutually exclusive; setting both is a
 startup error, since both serve `/oauth/*`.
 
+#### Generic OIDC setup (Keycloak, Authentik, Okta, …)
+
+For any OpenID Connect provider, use `IDP_PROVIDER=generic` and point it at the
+provider's endpoints (both listed in its `/.well-known/openid-configuration`):
+
+```bash
+IDP_PROVIDER=generic \
+IDP_AUTHORIZATION_ENDPOINT=https://idp.example.com/authorize \
+IDP_TOKEN_ENDPOINT=https://idp.example.com/token \
+IDP_CLIENT_ID=<client-id> \
+IDP_CLIENT_SECRET=<client-secret> \
+IDP_REQUIRED_GROUPS=vault-team \
+IDP_GROUPS_CLAIM=groups \
+BASE_URL=https://vault.example.com \
+npx obsidian-sync-mcp
+```
+
+In the provider, create a **confidential/web** client (it has a secret and does
+the authorization-code flow), and:
+
+1. **Redirect URI** — add `<BASE_URL>/oauth/callback` exactly. This is the list
+   that actually constrains where tokens can be sent; keep it tight (the
+   server's own `IDP_ALLOWED_REDIRECT_URIS` can only widen, not narrow — see the
+   note below).
+2. **Groups in the ID token** — the server reads membership from the ID token,
+   so the provider must put it there under the claim named by `IDP_GROUPS_CLAIM`
+   (default `groups`):
+   - **Keycloak** — add a *Group Membership* mapper on the client (or a dedicated
+     client scope), name it `groups`, and tick "Add to ID token". Untick "Full
+     group path" unless your `POLICY` uses `/parent/child` names.
+   - **Authentik** — the default `groups` scope already emits a `groups` claim in
+     the ID token; add that scope to the provider and request it (it is covered
+     by the default `IDP_SCOPES`).
+   - **Okta** — add a *Groups* claim to the **ID token** (not just the access
+     token) with a filter matching your vault groups, named `groups`.
+3. **Assignment = who can read this vault.** Restrict the app to the group(s)
+   that should reach this vault, and set `IDP_REQUIRED_GROUPS` to match. Because
+   reads are not scoped inside a vault, this assignment *is* the read boundary.
+
+Verify the ID token actually carries `groups` before rolling out — decode it at
+[jwt.io](https://jwt.io) or check the server log for `Auth denied … (claims
+carried: …)`, which lists exactly what arrived. Then map those group names to
+write scope with `POLICY` (below).
+
+This whole flow — discovery, dynamic client registration, consent, upstream
+login, callback, token exchange, the group gate, `POLICY` scoping, and the audit
+line — is covered end to end by `npm run test:idp`, which runs the server
+against a local OIDC stub. Point that test at your own provider's config to
+smoke-test a real tenant.
+
 #### Audit log
 
 Every tool call is logged as one JSON line — who called it, which tool, which

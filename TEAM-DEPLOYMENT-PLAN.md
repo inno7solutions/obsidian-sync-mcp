@@ -4,9 +4,11 @@ How to take obsidian-sync-mcp from a single-user server to a supportable interna
 multi-user deployment.
 
 Status: Phases 1–3 (the critical path — identity, authorization, audit) are
-built, tested, and on branch `claude/team-vault-deployment-8xkcfb`, pending a
-live-IdP acceptance run. Phases 4–8 remain. Verified against this repo at
-`v0.6.3` and `fastmcp@3.35.0`.
+built and tested on branch `claude/team-vault-deployment-8xkcfb`, including a
+full end-to-end OAuth run against a real OIDC provider (`npm run test:idp`, a
+local stub standing in for Keycloak/Authentik/Okta). IdP decision: **generic
+OIDC**. Phases 4–8 remain. Verified against this repo at `v0.6.3` and
+`fastmcp@3.35.0`.
 
 ---
 
@@ -54,7 +56,7 @@ ROADMAP
                    │ 8 MULTI-VAULT  registry → dbs, users, hosts,   │
                    │ 2-3 d          redirect URIs, Setup URIs       │
                    └────────────────────────────────────────────────┘
-  ≈9-13 d for one vault, +2-3 d for many · real blocker: IdP registration lead
+  ≈9-13 d for one vault, +2-3 d for many · 1-3 verified e2e (npm run test:idp)
 
 WHAT IT BUYS
   fixed              │ mitigated only        │ not fixable here
@@ -238,8 +240,9 @@ and the gate; a local smoke test confirms both discovery documents advertise our
 `BASE_URL`, that `/oauth/authorize` hands off upstream to the configured IdP,
 that `/mcp` answers 401 with the resource-metadata pointer, and that every
 misconfiguration fails fast at startup. **The end-to-end login and the
-group-denial path still need a real tenant** — that is the remaining Phase 1
-acceptance work, and it needs decision 1 (§7) settled first.
+group-denial path are now verified too** — `npm run test:idp` drives the full
+DCR → authorize → consent → upstream → callback → token flow against a local
+OIDC provider and asserts an out-of-group caller gets 403.
 
 ### Phase 2 — Per-user authorization (2 d) · closes gap 2 · DONE
 
@@ -291,9 +294,10 @@ Acceptance: unit tests for `resolvePolicy` and the resolver; an editor writes
 only in their folders; a reader's `tools/list` contains no write tools; an
 unmapped user is read-only. **Status:** all covered by tests
 (`src/policy.test.ts`, `src/tools.test.ts`) and by an end-to-end `tools/list`
-check over the MCP protocol. The one path still needing a live tenant is the
-same as Phase 1's — a real caller with real group claims resolving to the right
-scope; the group-claim wrinkles above are the thing to verify there first.
+check over the MCP protocol. This end-to-end path — a real caller with real group claims resolving to the
+right scope — is now verified by `npm run test:idp` against a live OIDC flow
+(local stub). The remaining real-tenant step is only to confirm the chosen
+provider emits `groups` in the ID token (the wrinkles above).
 
 ### Phase 3 — Audit (1 d) · closes gap 3 · DONE
 
@@ -665,9 +669,11 @@ schedule risk.
 
 ## 7. Decisions needed before Phase 1
 
-1. **Which IdP** — Entra, Google, or generic (Authentik/Keycloak)? Determines
-   whether we use `AzureProvider`/`GoogleProvider` or the generic
-   `OAuthProvider`, and how group claims arrive.
+1. **Which IdP** — DECIDED: **generic OIDC** (Keycloak / Authentik / Okta), via
+   fastmcp's `OAuthProvider`. Remaining sub-decision: which product, so its
+   `groups` mapper can be configured (see README "Generic OIDC setup"). The one
+   real-tenant step left is confirming that mapper emits `groups` in the ID
+   token.
 2. **Group → scope map** — the concrete `POLICY` content: who is read-only, who
    writes where. Recommend starting with exactly two groups (readers, and
    editors scoped to a couple of folders) and adding rules on demand.
