@@ -8,6 +8,64 @@ Status: plan, not yet implemented. Verified against this repo at `v0.6.3` and
 
 ---
 
+## The plan on one screen
+
+```
+DEPLOYMENT UNIT — repeat per vault, nothing shared between them
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Obsidian + LiveSync                                                       │
+│         │              local vault folder must be named exactly VAULT_NAME │
+│         ▼              (deep links carry it)                               │
+│  CouchDB   db:<vault>  1 db = 1 vault = 1 E2E salt = 1 crypto domain       │
+│         │              role-based _security; no read-only role exists      │
+│         ▼  member acct (not admin — admins bypass _security everywhere)    │
+│  MCP instance          own origin · own BASE_URL · own keys · own DATA_DIR │
+│    ├ authenticate ──►  identity {sub, email, groups}   from the ID token   │
+│    ├ policy       ──►  {readOnly | writeFolders[]}     default deny        │
+│    ├ canAccess    ──►  readers never see write tools                       │
+│    └ audit        ──►  actor · vault · tool · path      no note content    │
+│         ▲                                                                  │
+│         │ OAuth 2.1 + PKCE, DCR proxied upstream by fastmcp                │
+│  IdP app registration  assignment = who can read this vault                │
+└────────────────────────────────────────────────────────────────────────────┘
+  BASE_URL is the tenant boundary: iss/aud are checked, so one origin per vault
+  private notes → not hosted at all: VAULT_PATH on the person's own machine
+
+ROADMAP
+  critical path — minimum viable team deployment, ship to a pilot group
+  ┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
+  │ 1 IDENTITY  │───►│ 2 AUTHORIZATION │───►│ 3 AUDIT     │
+  │ IdP, no fork│    │ policy+canAccess│    │ who did what│
+  │ 2-3 d       │    │ 2 d             │    │ 1 d         │
+  └─────────────┘    └─────────────────┘    └─────────────┘
+  ┌─────────────┐  in parallel, ops not code
+  │ 4 SECRETS   │  member acct · secret manager · pinned image      1-2 d
+  └─────────────┘
+                   after the pilot
+                   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+                   │ 5 CONCURRENCY│ │ 6 INJECTION  │ │ 7 OPS/SCALE  │
+                   │ preconditions│ │ ro instrs    │ │ token store  │
+                   │ 2 d          │ │ 1 d          │ │ 1-2 d        │
+                   └──────────────┘ └──────────────┘ └──────────────┘
+                   when vault #2 appears
+                   ┌────────────────────────────────────────────────┐
+                   │ 8 MULTI-VAULT  registry → dbs, users, hosts,   │
+                   │ 2-3 d          redirect URIs, Setup URIs       │
+                   └────────────────────────────────────────────────┘
+  ≈9-13 d for one vault, +2-3 d for many · real blocker: IdP registration lead
+
+WHAT IT BUYS
+  fixed              │ mitigated only        │ not fixable here
+  ───────────────────┼───────────────────────┼──────────────────────────────
+  real identity      │ concurrent writes     │ read scoping inside a vault
+  per-user writes    │ prompt injection      │ two vaults in one database
+  audit trail        │                       │ conflict resolution / merge
+```
+
+Everything below is the reasoning and the verified detail behind this.
+
+---
+
 ## 0. The framing decision: shared vault or vault-per-person
 
 LiveSync's unit of isolation is the vault: one vault = one CouchDB database = one
