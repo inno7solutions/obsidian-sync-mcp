@@ -25,13 +25,15 @@ So:
   That is achievable inside one instance (see §1).
 
 **Recommendation: one shared team vault as the primary deployment**, plus
-optional per-person vaults for people who need private notes, each its own
-instance. Treat the team vault as "internal, readable by everyone on the team" —
+private vaults for people who need them — run locally, not hosted (§4).
+Treat the team vault as "internal, readable by everyone on the team" —
 if a note can't be seen by the whole team, it doesn't belong in the team vault.
 Don't try to reconstruct per-person read scoping with folder conventions; there is
 no server-side enforcement for reads and there is no cheap way to add one.
 
-Everything below assumes the shared team vault.
+Sections 1-3 assume the shared team vault. §4 covers what changes when there
+is more than one — which there will be, as soon as anyone needs notes the
+whole team cannot read.
 
 ---
 
@@ -77,7 +79,7 @@ Consequences for the original gap list:
 - The remaining work is ~4 small, additive modules in this repo — which is our
   own fork, so the "fork or not" question is really "how cheap do we keep the
   rebase against `es617/obsidian-sync-mcp`". Answer: new files, minimal
-  touch points, and upstream the generic parts (§7).
+  touch points, and upstream the generic parts (§8).
 
 ---
 
@@ -99,6 +101,9 @@ MCP instance (one, shared team vault)
 One instance, per-caller policy. Instance-per-role only if we later need
 different `MCP_INSTRUCTIONS` per role, or read isolation (which means separate
 vaults anyway).
+
+For more than one vault, this whole block repeats per vault, one origin each —
+see §4.
 
 ---
 
@@ -295,9 +300,133 @@ every teammate's agent. This is mitigation, not a fix.
   (remove from IdP group; sessions die within the access-token TTL), restoring
   CouchDB.
 
+### Phase 8 — Multi-vault provisioning (2–3 d) · only if §4 applies
+
+One vault registry file as the source of truth — per vault: name, CouchDB
+database, hostname, owning group, sensitivity tier. Generate from it: compose /
+fly config per instance, the IdP redirect URI list, CouchDB users and
+`_security` docs, and LiveSync Setup URIs. `deploy/generate-setup-uri.mjs`
+already mints a per-vault Setup URI from `hostname`/`username`/`password`/
+`database`/`passphrase` — drive it from the registry instead of by hand.
+
+Plus: one rollout script that bumps the pinned image across every instance (N
+instances means N chances to forget one), and a per-instance health check.
+Mostly ops glue, no server code.
+
 ---
 
-## 4. Sequencing
+## 4. Multiple vaults
+
+Three things drive a second vault: notes the whole team cannot read (personal,
+HR, legal), different membership (per-client or per-project), and different
+sensitivity tiers (own passphrase, own host). All three are the same mechanism —
+another vault, another instance.
+
+### Topology: one instance per vault, one *origin* per vault
+
+Not just one port per vault — one hostname. Two verified reasons:
+
+1. **`BASE_URL` is the cryptographic tenant boundary.** With token swap on
+   (default), the proxy's JWT issuer is constructed with
+   `issuer = audience = baseUrl` (`dist/chunk-H4VC4YTC.js:886-892`) and
+   verification rejects a mismatched `iss` or `aud`
+   (`dist/chunk-H4VC4YTC.js:591-604`). So a distinct `BASE_URL` per vault means a
+   token minted for vault A is refused by vault B — even if the signing keys were
+   shared. The converse is the trap: two instances configured with the *same*
+   `BASE_URL` would accept each other's tokens if they shared a signing key.
+   Distinct hostname per vault, and never share `jwtSigningKey` / `encryptionKey`
+   across vaults regardless.
+2. **You cannot path-multiplex vaults under one origin.** fastmcp does serve the
+   RFC 9728 path-suffixed protected-resource document
+   (`/.well-known/oauth-protected-resource<endpoint>`), but
+   `/.well-known/oauth-authorization-server` and every `/oauth/*` proxy route are
+   fixed at origin root (`dist/chunk-UVX47AE5.js:1789-1817`), as is this repo's
+   own password-mode discovery (`src/auth.ts:116,124`). Several instances behind
+   one origin collide there.
+
+So: `vault-<name>.mcp.internal` → container, routed by host header at the
+reverse proxy. Nothing clever.
+
+### Rejected: one process serving many vaults
+
+Tempting — one URL, one OAuth flow, one audit stream, and vault-granular read
+scoping via `canAccess`. But it means a real fork (a `VaultBackend` and
+`SearchIndex` per vault, a vault argument or namespaced tools threaded through
+all of `src/tools.ts`, `DATA_DIR` per vault), every passphrase and every
+decrypted vault in one process, and a policy bug becomes a cross-vault read.
+Process isolation is the only control here that isn't code we have to get right.
+Revisit only if instance count becomes unmanageable — call it 10-15 vaults.
+
+### Footguns, verified in this codebase
+
+1. **`DATA_DIR` is keyed on `VAULT_NAME` alone** —
+   `vaultId = sha256(VAULT_NAME)[0:12]` (`src/main.ts:98-100`). Two instances
+   with the same `VAULT_NAME` sharing a data volume land in the same directory
+   and fight over `search-index.json` and `auth-tokens.json`; with different
+   passphrases each fails to decrypt the other's index and rebuilds, forever.
+   Distinct `VAULT_NAME` per vault, and prefer a distinct `DATA_DIR` per
+   instance.
+2. **Deep links embed `VAULT_NAME`** (`src/deeplink.ts:8`) as
+   `obsidian://open?vault=<name>`, which must match the Obsidian vault *folder
+   name* on each person's machine. So vault naming is a team-wide onboarding
+   rule, not a server detail: pick the names once (`team-knowledge`,
+   `client-acme`) and have everyone use them locally.
+3. **CouchDB provisioning is single-vault today.**
+   `deploy/mcp-with-db/entrypoint.sh:71-76` writes `_security` for one database.
+   Per vault we want its own database plus its own `livesync-<vault>` and
+   `mcp-<vault>` users, so a leaked LiveSync credential reaches exactly one
+   vault.
+4. **Memory and change feeds are per instance.** Each instance holds its own
+   in-memory index and its own `_changes` feed, so size per vault rather than per
+   team (the 256 MB in `deploy/mcp-only/fly.toml` is a solo-vault figure). Fly's
+   `auto_stop_machines = 'suspend'` with `min_machines_running = 0` means idle
+   vaults cost almost nothing and a cold start resumes from the persisted
+   `since` — so many vaults is cheap as long as few are busy.
+
+### Identity and access, per vault
+
+- **Per-vault app registration in the IdP is the read-scoping mechanism.** One
+  registration per vault (redirect URI `https://<vault-host>/oauth/callback`)
+  with user or group assignment required means vault *membership* is administered
+  in the IdP, and the server needs no read-scoping code at all: a non-member
+  never gets a token the instance will accept. This is the answer to the §0
+  problem — enforce read confidentiality at the IdP and instance boundary, since
+  it cannot be enforced inside a vault.
+- **Cheaper alternative:** one app registration with N redirect URIs, plus a
+  required-group check in each instance's `authenticate` (reject when the
+  expected group claim is absent). Less admin work, weaker guarantee — the IdP
+  will issue tokens to anyone in the tenant and the check is ours to get right.
+  Recommend per-vault registrations for confidential vaults, shared app plus
+  group check for ordinary team vaults.
+- **Policy stays one file.** The Phase 2 `POLICY` becomes vault-keyed, mounted
+  read-only into every instance, each selecting its own section by `VAULT_NAME`.
+  One reviewable source of truth in git beats N env blobs drifting apart; add
+  `vault` to the `resolvePolicy` inputs.
+- **Audit gains a `vault` field** (Phase 3) and every instance ships to one
+  sink, so "who touched what, anywhere" stays a single query.
+
+### Client-side reality
+
+Each vault is a separate MCP server entry in the client, so a person doing three
+vaults does three OAuth flows and sees three copies of the same ten tool names,
+distinguished only by server name. That confuses model tool-selection more than
+it confuses people. Mitigate by naming each server after its vault in client
+config and using the per-instance `MCP_INSTRUCTIONS` to state which vault this
+is and what belongs in it. It is also a real argument for **few broad vaults
+over many narrow ones**.
+
+### Personal vaults: don't host them
+
+If someone wants a private vault, the cheapest safe answer is filesystem mode on
+their own machine — `VAULT_PATH` with `npx obsidian-sync-mcp`, no auth, the
+loopback plus Host/Origin guard that already ships — or their own local CouchDB.
+No hosted instance, no OAuth app, no secret we hold, no per-person container.
+Reserve hosted instances for vaults with more than one member. That is what keeps
+instance count proportional to *teams* rather than *people*.
+
+---
+
+## 5. Sequencing
 
 Phases 1 → 2 → 3 are the critical path and the minimum viable team deployment:
 real identity, default-deny per-user writes, and an audit trail. Ship those
@@ -308,15 +437,23 @@ the CouchDB user change.
 
 5 and 6 are hardening; ship after the pilot. 7 is only needed at scale-out.
 
-Rough total: 9–13 dev-days plus IdP app-registration lead time, which is
-usually the real schedule risk.
+Phase 8 is independent of 1–7 and only applies once a second vault exists. Do
+not build it speculatively — but do pick vault *names* and the `DATA_DIR` /
+`VAULT_NAME` convention (§4) before the pilot, because changing a vault name
+later breaks everyone's deep links and orphans the persisted index.
+
+Rough total: 9–13 dev-days for a single vault, plus 2–3 for multi-vault
+provisioning, plus IdP app-registration lead time — which is usually the real
+schedule risk.
 
 ---
 
-## 5. What we are explicitly not solving
+## 6. What we are explicitly not solving
 
 - **Read confidentiality inside a vault.** Not possible in this architecture.
-  Separate vault + separate instance, or accept team-wide read.
+  Solved *at vault granularity* by §4 — separate vault, separate instance,
+  membership administered in the IdP — or accept team-wide read. There is no
+  folder-level read scoping and no cheap way to add one.
 - **True multi-writer conflict resolution.** Phase 5 narrows the window; it does
   not give us merge semantics or `_rev` preconditions end-to-end.
 - **Prompt injection from vault content.** Mitigated, not eliminated.
@@ -324,7 +461,7 @@ usually the real schedule risk.
 
 ---
 
-## 6. Decisions needed before Phase 1
+## 7. Decisions needed before Phase 1
 
 1. **Which IdP** — Entra, Google, or generic (Authentik/Keycloak)? Determines
    whether we use `AzureProvider`/`GoogleProvider` or the generic
@@ -332,16 +469,20 @@ usually the real schedule risk.
 2. **Group → scope map** — the concrete `POLICY` content: who is read-only, who
    writes where. Recommend starting with exactly two groups (readers, and
    editors scoped to a couple of folders) and adding rules on demand.
-3. **Shared team vault only, or team vault + personal vaults?** Personal vaults
-   mean one instance each; decide before sizing.
-4. **Where audit logs go**, and retention — including that note *paths* are
+3. **Which vaults exist, and who is in each?** This is the §4 registry, and it
+   drives instance count, IdP registrations, CouchDB databases and cost. Bias
+   toward few broad vaults.
+4. **Personal vaults: hosted or local?** Recommendation is local filesystem mode
+   (§4) — no instance, no OAuth app, no secret we hold. Hosting them instead
+   makes instance count scale with headcount.
+5. **Where audit logs go**, and retention — including that note *paths* are
    sensitive.
-5. **Hosting** — Fly (matching `deploy/`) or our own infra. Affects secret
+6. **Hosting** — Fly (matching `deploy/`) or our own infra. Affects secret
    management and the single-machine constraint.
 
 ---
 
-## 7. Keeping the fork cheap
+## 8. Keeping the fork cheap
 
 All new code lands in new files — `src/auth-idp.ts`, `src/policy.ts`,
 `src/audit.ts` — with small, surgical edits to `src/main.ts` (auth mode
