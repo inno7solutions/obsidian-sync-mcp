@@ -26,6 +26,8 @@ const ALLOWED_ARG_KEYS = [
     "sort_by",
     "modified_after",
     "limit",
+    "vault",
+    "paths",
 ] as const;
 
 /** Tools whose effect is hard to reverse — flagged for easy alerting. */
@@ -82,6 +84,8 @@ export function redactArgs(args: unknown): Record<string, unknown> {
     }
     if (typeof a.content === "string") out.content_len = Buffer.byteLength(a.content);
     if (typeof a.old_text === "string") out.old_text_len = Buffer.byteLength(a.old_text);
+    // Search terms can quote note text, so only their size is logged.
+    if (typeof a.query === "string") out.query_len = Buffer.byteLength(a.query);
     return out;
 }
 
@@ -127,6 +131,7 @@ export type AuditSink = (line: string) => void;
 export interface AuditLogger {
     enabled: boolean;
     record(input: {
+        vault: string;
         tool: string;
         args: unknown;
         session: unknown;
@@ -136,6 +141,8 @@ export interface AuditLogger {
         sessionId?: string;
         requestId?: string;
     }): void;
+    /** One line per admin UI change (who changed which user/vault/grant/token). */
+    admin(action: string, target: string, actor?: string): void;
 }
 
 /**
@@ -143,21 +150,26 @@ export interface AuditLogger {
  * call `record` unconditionally. The default sink is stdout as one JSON line per
  * event; a deployment ships those wherever its logs go.
  */
-export function makeAuditLogger(opts: { vault: string; enabled: boolean; sink?: AuditSink }): AuditLogger {
+export function makeAuditLogger(opts: { enabled: boolean; sink?: AuditSink }): AuditLogger {
     if (!opts.enabled) {
-        return { enabled: false, record() {} };
+        return { enabled: false, record() {}, admin() {} };
     }
     const sink: AuditSink = opts.sink ?? ((line) => console.log(line));
+    // Auditing must never break a tool call or an admin action.
+    const emit = (line: () => string) => {
+        try {
+            sink(line());
+        } catch (err) {
+            console.error("Audit logging failed:", (err as Error).message);
+        }
+    };
     return {
         enabled: true,
         record(input) {
-            try {
-                const event = buildAuditEvent({ ...input, vault: opts.vault, now: new Date().toISOString() });
-                sink(formatAuditLine(event));
-            } catch (err) {
-                // Auditing must never break a tool call.
-                console.error("Audit logging failed:", (err as Error).message);
-            }
+            emit(() => formatAuditLine(buildAuditEvent({ ...input, now: new Date().toISOString() })));
+        },
+        admin(action, target, actor = "admin") {
+            emit(() => JSON.stringify({ ts: new Date().toISOString(), evt: "admin", actor, action, target }));
         },
     };
 }

@@ -1,7 +1,7 @@
-// Folder-scoped write access (WRITE_FOLDERS env var).
-// When set, write tools only accept paths inside the listed vault-relative folders.
+// Folder-scoped write access (a registry grant in "folders" mode).
+// Write tools only accept paths inside the listed vault-relative folders.
 
-/** Parse the WRITE_FOLDERS env var into a normalized folder list, or null for unrestricted. */
+/** Parse a comma-separated folder list into a normalized folder list, or null for unrestricted. */
 export function parseWriteFolders(raw: string | undefined): string[] | null {
     if (raw === undefined) return null;
     const folders = raw

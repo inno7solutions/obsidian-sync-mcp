@@ -4,7 +4,7 @@
 
 import { DirectFileManipulator } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
 import type { DirectFileManipulatorOptions } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
-import { createTextBlob } from "../lib/livesync-commonlib/src/common/utils.ts";
+import { createTextBlob, isTextDocument, readContent } from "../lib/livesync-commonlib/src/common/utils.ts";
 import type { FilePathWithPrefix } from "../lib/livesync-commonlib/src/common/types.ts";
 import type { MetaEntry } from "../lib/livesync-commonlib/src/API/DirectFileManipulatorV2.ts";
 import { isPathProbablyObfuscated, decrypt } from "octagonal-wheels/encryption/encryption";
@@ -56,7 +56,7 @@ export class Vault implements VaultBackend {
 
     /**
      * Detect whether the vault's document IDs are obfuscated and, if the
-     * configured COUCHDB_OBFUSCATE_PROPERTIES doesn't match, correct it.
+     * configured obfuscation setting doesn't match, correct it.
      * A mismatched setting can never work: path→id resolution misses every
      * existing note on read, and writes produce docs LiveSync clients ignore
      * (issues #4, #10). The database is the ground truth.
@@ -68,7 +68,7 @@ export class Vault implements VaultBackend {
         if (format === "mixed") {
             console.warn(
                 "Warning: vault contains both obfuscated and plaintext document IDs. " +
-                `Keeping COUCHDB_OBFUSCATE_PROPERTIES=${configured}. ` +
+                `Keeping path obfuscation ${configured ? "on" : "off"}. ` +
                 "This usually means \"Obfuscate properties\" was toggled without rebuilding the database — consider rebuilding it from LiveSync.",
             );
             return;
@@ -78,15 +78,13 @@ export class Vault implements VaultBackend {
         if (actual && !this.passphrase) {
             throw new Error(
                 "Vault uses obfuscated document IDs (LiveSync \"Obfuscate properties\"), which requires the E2E passphrase. " +
-                "Set COUCHDB_PASSPHRASE and COUCHDB_OBFUSCATE_PROPERTIES=true.",
+                "Register the vault in the admin UI with its E2E passphrase.",
             );
         }
         console.warn(
             actual
-                ? "Warning: vault uses obfuscated document IDs but COUCHDB_OBFUSCATE_PROPERTIES is not set to true. " +
-                  "Enabling path obfuscation automatically — set COUCHDB_OBFUSCATE_PROPERTIES=true to silence this warning."
-                : "Warning: COUCHDB_OBFUSCATE_PROPERTIES=true but vault uses plaintext document IDs. " +
-                  "Disabling path obfuscation automatically — set COUCHDB_OBFUSCATE_PROPERTIES=false to silence this warning.",
+                ? "Warning: vault uses obfuscated document IDs; enabling path obfuscation automatically."
+                : "Warning: vault uses plaintext document IDs although it has an E2E passphrase; disabling path obfuscation automatically.",
         );
         await this.manipulator.close();
         this.manipulator = new DirectFileManipulator(Vault.buildOptions(this.config, actual));
@@ -209,10 +207,39 @@ export class Vault implements VaultBackend {
         this.validatePath(path);
         const entry = await this.manipulator.get(path as FilePathWithPrefix);
         if (!entry) return null;
+        // Joining a binary file's chunks would hand back base64 noise (and a move would corrupt it).
+        if (!isTextDocument(entry as any)) {
+            throw new Error(`Not a text file: ${path}. Notes, text files and images (png, jpg, gif, webp) can be read.`);
+        }
         if ("data" in entry && Array.isArray(entry.data)) {
             return entry.data.join("");
         }
         return null;
+    }
+
+    async readBinary(path: string, maxBytes: number): Promise<{ size: number; bytes?: Uint8Array } | null> {
+        this.validatePath(path);
+        // Check the size from metadata first so an oversized file's chunks are never loaded.
+        const meta = await this.manipulator.get(path as FilePathWithPrefix, true);
+        if (!meta || (meta as any).deleted) return null;
+        const size = (meta as any).size ?? 0;
+        if (size > maxBytes) return { size };
+        const entry = await this.manipulator.get(path as FilePathWithPrefix);
+        if (!entry) return null;
+        const content = readContent(entry as any);
+        return { size, bytes: typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content) };
+    }
+
+    async findByName(name: string): Promise<string[]> {
+        const wanted = name.toLowerCase();
+        const hits: string[] = [];
+        for await (const doc of this.manipulator.enumerateAllNormalDocs({ metaOnly: true })) {
+            const entry = doc as MetaEntry;
+            if (entry.deleted) continue;
+            const p = entry.path ?? "";
+            if (p.slice(p.lastIndexOf("/") + 1).toLowerCase() === wanted) hits.push(p);
+        }
+        return hits.sort((a, b) => a.length - b.length || a.localeCompare(b));
     }
 
     async writeNote(path: string, content: string): Promise<boolean> {

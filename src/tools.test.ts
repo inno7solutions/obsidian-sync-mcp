@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerTools } from "./tools.js";
-import { makeAccessResolver, parsePolicy } from "./policy.js";
 import { makeAuditLogger } from "./audit.js";
+import { makeResolver } from "./mcp-access.js";
+import { buildSnapshot, hashToken } from "./registry/model.js";
 
 /** Minimal stand-in for FastMCP that just captures registered tools. */
 function stubServer() {
@@ -15,13 +16,17 @@ function stubServer() {
     };
 }
 
+/** 1×1 transparent PNG. */
+const PNG = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64"));
+
 /** A vault stub that records writes and serves one existing note. */
-function stubVault() {
+function stubVault(name: string) {
     const calls: Array<[string, string]> = [];
     return {
+        name,
         calls,
         async readNote(path: string) {
-            return path === "Inbox/existing.md" ? "old" : null;
+            return path === "Inbox/existing.md" ? `old in ${name}` : null;
         },
         async writeNote(path: string, content: string) {
             calls.push([path, content]);
@@ -35,6 +40,14 @@ function stubVault() {
         },
         async getMetadata() {
             return null;
+        },
+        async readBinary(path: string) {
+            if (path === "img/pic.png") return { size: PNG.length, bytes: PNG };
+            if (path === "big.png") return { size: 9_000_000 };
+            return null;
+        },
+        async findByName(name: string) {
+            return ({ "pic.png": ["img/pic.png"], "existing.md": ["Inbox/existing.md"] } as Record<string, string[]>)[name] ?? [];
         },
         async listNotes() {
             return [];
@@ -55,116 +68,189 @@ const searchIndex = {
     getTags: () => [],
     listAllTags: () => [],
     getBacklinks: () => [],
+    search: (q: string) => (q === "budget" ? { hits: [{ path: "Inbox/existing.md", mtime: 0, matches: 3, snippet: "the budget" }], total: 2 } : { hits: [], total: 0 }),
 } as any;
 
-function register(resolveAccess: any, policyActive = true, vaultOverride?: any) {
+const vault = (slug: string, extra = {}) => ({ type: "vault", slug, displayName: slug.toUpperCase(), obsidianName: `Obs ${slug}`, db: `vault-${slug}`, archived: false, createdAt: "", ...extra });
+const user = (username: string, extra = {}) => ({ type: "user", username, email: `${username}@x.com`, name: username, couchPasswordEnc: "", disabled: false, createdAt: "", ...extra });
+const grant = (username: string, v: string, mode: string, folders: string[] = []) => ({ type: "grant", username, vault: v, mode, folders });
+const token = (t: string, username: string) => ({ type: "token", hash: hashToken(t), username, label: "", createdAt: "" });
+
+function setup(docs: unknown[]) {
+    let snapshot = buildSnapshot(docs);
+    const vaults = { a: stubVault("a"), b: stubVault("b"), c: stubVault("c") } as Record<string, ReturnType<typeof stubVault>>;
     const server = stubServer();
-    const vault = vaultOverride ?? stubVault();
     const auditLines: string[] = [];
-    const audit = makeAuditLogger({ vault: "MyVault", enabled: true, sink: (l) => auditLines.push(l) });
-    registerTools(server as any, vault as any, searchIndex, "MyVault", { resolveAccess, policyActive }, audit);
-    return { server, vault, auditLines };
+    const audit = makeAuditLogger({ enabled: true, sink: (l) => auditLines.push(l) });
+    const resolver = makeResolver(() => snapshot, async (slug) => ({ vault: vaults[slug] as any, index: searchIndex }));
+    registerTools(server as any, resolver, audit);
+    const call = (tool: string, args: Record<string, unknown>, tok: string) =>
+        server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken(tok), identity: { sub: "x" } } });
+    return { server, vaults, auditLines, call, setDocs: (d: unknown[]) => (snapshot = buildSnapshot(d)) };
 }
 
-const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"];
-const editorSession = { authenticated: true, identity: { sub: "u1", groups: ["editors"] } };
-const readerSession = { authenticated: true, identity: { sub: "u2", groups: ["readers"] } };
+const DOCS = [
+    vault("a"),
+    vault("b"),
+    vault("c"),
+    user("alice"),
+    user("bob"),
+    grant("alice", "a", "write"),
+    grant("alice", "b", "read"),
+    grant("bob", "b", "folders", ["Inbox"]),
+    token("tok-alice", "alice"),
+    token("tok-bob", "bob"),
+];
 
-const POLICY = parsePolicy(JSON.stringify([
-    { group: "editors", writeFolders: ["Inbox"] },
-    { group: "*", readOnly: true },
-]));
-
-test("read tools are always registered", () => {
-    const { server } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    for (const t of ["read_note", "list_notes", "list_folders", "list_tags", "get_note_metadata"]) {
-        assert.ok(server.tools.has(t), `${t} should be registered`);
-    }
+test("list_vaults shows only granted vaults with access level", async () => {
+    const { call } = setup(DOCS);
+    const out = await call("list_vaults", {}, "tok-alice");
+    assert.match(out, /- a — A \(read\/write\)/);
+    assert.match(out, /- b — B \(read-only\)/);
+    assert.doesNotMatch(out, /- c/);
 });
 
-test("write tools are registered but gated by canAccess", () => {
-    const { server } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    for (const t of WRITE_TOOLS) {
-        const tool = server.tools.get(t);
-        assert.ok(tool, `${t} should be registered`);
-        assert.equal(typeof tool.canAccess, "function", `${t} should have canAccess`);
-        assert.equal(tool.canAccess(editorSession), true, `editor can access ${t}`);
-        assert.equal(tool.canAccess(readerSession), false, `reader cannot access ${t}`);
-    }
+test("vault argument is required when the user has several vaults", async () => {
+    const { call } = setup(DOCS);
+    assert.match(await call("read_note", { path: "Inbox/existing.md" }, "tok-alice"), /pass the 'vault' argument.*a, b/);
 });
 
-test("write_note enforces the caller's folder scope at call time", async () => {
-    const { server, vault } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    const writeNote = server.tools.get("write_note");
-
-    const denied = await writeNote.execute({ path: "Projects/x.md", content: "hi" }, { session: editorSession });
-    assert.match(denied, /Write access denied/);
-    assert.match(denied, /Inbox\//); // the message names the caller's actual scope
-    assert.equal(vault.calls.length, 0, "denied write must not reach the vault");
-
-    const ok = await writeNote.execute({ path: "Inbox/x.md", content: "hi" }, { session: editorSession });
-    assert.match(ok, /Note saved/);
-    assert.deepEqual(vault.calls, [["Inbox/x.md", "hi"]]);
+test("a single-vault user may omit the vault argument", async () => {
+    const { call } = setup(DOCS);
+    assert.match(await call("read_note", { path: "Inbox/existing.md" }, "tok-bob"), /old in b/);
 });
 
-test("move_note requires both ends to be writable", async () => {
-    const { server } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    const moveNote = server.tools.get("move_note");
-    // Source in scope, destination out of scope → denied.
-    const denied = await moveNote.execute({ from: "Inbox/a.md", to: "Projects/a.md" }, { session: editorSession });
-    assert.match(denied, /Write access denied/);
-    assert.match(denied, /Projects/); // names the offending path
+test("deep links use the vault's Obsidian name", async () => {
+    const { call } = setup(DOCS);
+    assert.match(await call("read_note", { vault: "a", path: "Inbox/existing.md" }, "tok-alice"), /obsidian:\/\/open\?vault=Obs%20a&file=Inbox%2Fexisting/);
 });
 
-test("the process ceiling overrides a permissive policy", () => {
-    // Policy says editors write Inbox, but the container is read-only.
-    const { server } = register(makeAccessResolver(POLICY, { readOnly: true, writeFolders: null }));
-    for (const t of WRITE_TOOLS) {
-        assert.equal(server.tools.get(t).canAccess(editorSession), false, `${t} hidden under read-only ceiling`);
-    }
+test("ungranted vaults are not reachable", async () => {
+    const { call, vaults } = setup(DOCS);
+    assert.match(await call("read_note", { vault: "c", path: "x.md" }, "tok-alice"), /not found or not accessible: c/);
+    assert.match(await call("write_note", { vault: "a", path: "x.md", content: "hi" }, "tok-bob"), /not found or not accessible: a/);
+    assert.equal(vaults.a.calls.length, 0);
 });
 
-test("audit: a successful write is logged as ok with the actor and no body", async () => {
-    const { server, auditLines } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    await server.tools.get("write_note").execute({ path: "Inbox/x.md", content: "secret body" }, { session: editorSession });
-    assert.equal(auditLines.length, 1);
-    const e = JSON.parse(auditLines[0]);
-    assert.equal(e.tool, "write_note");
-    assert.equal(e.outcome, "ok");
-    assert.equal(e.actor, "u1"); // editorSession has no email → sub
-    assert.equal(e.params.content_len, Buffer.byteLength("secret body"));
+test("write access is per vault", async () => {
+    const { call, vaults } = setup(DOCS);
+    assert.match(await call("write_note", { vault: "a", path: "x.md", content: "hi" }, "tok-alice"), /Note saved/);
+    assert.match(await call("write_note", { vault: "b", path: "x.md", content: "hi" }, "tok-alice"), /Write access denied.*vault 'b' \(read-only\)/);
+    assert.deepEqual(vaults.a.calls, [["x.md", "hi"]]);
+    assert.equal(vaults.b.calls.length, 0);
+});
+
+test("folder grants scope writes, and move_note checks both ends", async () => {
+    const { call, vaults } = setup(DOCS);
+    assert.match(await call("write_note", { path: "Projects/x.md", content: "hi" }, "tok-bob"), /Write access denied.*Inbox\//);
+    assert.match(await call("write_note", { path: "Inbox/x.md", content: "hi" }, "tok-bob"), /Note saved/);
+    assert.match(await call("move_note", { from: "Inbox/a.md", to: "Projects/a.md" }, "tok-bob"), /Write access denied: 'Projects\/a.md'/);
+    assert.deepEqual(vaults.b.calls, [["Inbox/x.md", "hi"]]);
+});
+
+test("revoking a token, disabling a user or archiving a vault applies to the next call", async () => {
+    const { call, setDocs } = setup(DOCS);
+    setDocs(DOCS.filter((d: any) => d.hash !== hashToken("tok-bob")));
+    assert.match(await call("read_note", { path: "Inbox/existing.md" }, "tok-bob"), /no longer valid/);
+    setDocs(DOCS.map((d: any) => (d.type === "user" && d.username === "bob" ? { ...d, disabled: true } : d)));
+    assert.match(await call("read_note", { path: "Inbox/existing.md" }, "tok-bob"), /no vault access/);
+    setDocs(DOCS.map((d: any) => (d.type === "vault" && d.slug === "a" ? { ...d, archived: true } : d)));
+    assert.match(await call("read_note", { vault: "a", path: "x.md" }, "tok-alice"), /not found or not accessible: a/);
+});
+
+test("audit: records vault and actor, never the body", async () => {
+    const { call, auditLines } = setup(DOCS);
+    await call("write_note", { vault: "a", path: "x.md", content: "secret body" }, "tok-alice");
+    await call("write_note", { vault: "b", path: "x.md", content: "hi" }, "tok-alice");
+    const [ok, denied] = auditLines.map((l) => JSON.parse(l));
+    assert.equal(ok.vault, "a");
+    assert.equal(ok.outcome, "ok");
+    assert.equal(ok.params.content_len, Buffer.byteLength("secret body"));
     assert.ok(!auditLines[0].includes("secret body"));
+    assert.equal(denied.vault, "b");
+    assert.equal(denied.outcome, "denied");
 });
 
-test("audit: a policy denial is logged as denied", async () => {
-    const { server, auditLines } = register(makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }));
-    await server.tools.get("write_note").execute({ path: "Projects/x.md", content: "hi" }, { session: editorSession });
-    assert.equal(JSON.parse(auditLines[0]).outcome, "denied");
+test("audit: inaccessible vault is logged as denied", async () => {
+    const { call, auditLines } = setup(DOCS);
+    await call("read_note", { vault: "c", path: "x.md" }, "tok-alice");
+    const e = JSON.parse(auditLines[0]);
+    assert.equal(e.vault, "c");
+    assert.equal(e.outcome, "denied");
 });
 
 test("audit: a thrown tool error is logged as error and rethrown", async () => {
-    const throwingVault = { ...stubVault(), async writeNote() { throw new Error("couchdb down"); } };
-    const { server, auditLines } = register(
-        makeAccessResolver(POLICY, { readOnly: false, writeFolders: null }),
-        true,
-        throwingVault,
-    );
-    await assert.rejects(
-        () => server.tools.get("write_note").execute({ path: "Inbox/x.md", content: "hi" }, { session: editorSession }),
-        /couchdb down/,
-    );
-    assert.equal(auditLines.length, 1);
+    const { call, vaults, auditLines } = setup(DOCS);
+    vaults.a.writeNote = async () => {
+        throw new Error("couchdb down");
+    };
+    await assert.rejects(() => call("write_note", { vault: "a", path: "x.md", content: "hi" }, "tok-alice"), /couchdb down/);
     const e = JSON.parse(auditLines[0]);
     assert.equal(e.outcome, "error");
     assert.equal(e.error, "couchdb down");
 });
 
-test("no policy: canAccess follows the ceiling for everyone", () => {
-    const openResolver = makeAccessResolver(null, { readOnly: false, writeFolders: null });
-    const { server: open } = register(openResolver, false);
-    assert.equal(open.tools.get("write_note").canAccess(readerSession), true);
+test("move_note refuses to overwrite an existing note", async () => {
+    const { call, vaults } = setup(DOCS);
+    let moved = false;
+    vaults.b.moveNote = async () => (moved = true);
+    assert.match(await call("move_note", { from: "Inbox/a.md", to: "Inbox/existing.md" }, "tok-bob"), /Destination already exists/);
+    assert.equal(moved, false);
+    assert.match(await call("move_note", { from: "Inbox/a.md", to: "Inbox/new.md" }, "tok-bob"), /Moved/);
+});
 
-    const roResolver = makeAccessResolver(null, { readOnly: true, writeFolders: null });
-    const { server: ro } = register(roResolver, false);
-    assert.equal(ro.tools.get("write_note").canAccess(readerSession), false);
+test("read_notes returns found notes and flags missing ones", async () => {
+    const { call } = setup(DOCS);
+    const out = await call("read_notes", { paths: ["Inbox/existing.md", "nope.md"] }, "tok-bob");
+    assert.match(out, /## Inbox\/existing.md\n\[Open in Obsidian\][^\n]*\n\nold in b/);
+    assert.match(out, /## nope.md\n\nNote not found\./);
+});
+
+test("search_notes lists hits with snippet, link and overflow count", async () => {
+    const { call, auditLines } = setup(DOCS);
+    const out = await call("search_notes", { query: "budget" }, "tok-bob");
+    assert.match(out, /- \[Inbox\/existing.md\]\(obsidian:\/\/open[^)]*\)\n  > the budget/);
+    assert.match(out, /and 1 more/);
+    assert.match(await call("search_notes", { query: "zzz" }, "tok-bob"), /No notes match: zzz/);
+    assert.ok(!auditLines[0].includes("budget"), "query text stays out of the audit log");
+    assert.equal(JSON.parse(auditLines[0]).params.query_len, 6);
+});
+
+test("read_note returns images as image content, resolving a bare file name", async () => {
+    const { call } = setup(DOCS);
+    const out = await call("read_note", { path: "pic.png" }, "tok-bob");
+    assert.equal(out.content[1].type, "image");
+    assert.equal(out.content[1].mimeType, "image/png");
+    assert.equal(Buffer.from(out.content[1].data, "base64").length, PNG.length);
+    assert.match(out.content[0].text, /^img\/pic.png\n\[Open in Obsidian\]/);
+    assert.match(await call("read_note", { path: "big.png" }, "tok-bob"), /Image too large to return: big.png is 9.0 MB/);
+    assert.match(await call("read_note", { path: "nope.png" }, "tok-bob"), /Note not found: nope.png/);
+});
+
+test("read_note resolves a bare note name like an Obsidian link", async () => {
+    const { call } = setup(DOCS);
+    assert.match(await call("read_note", { path: "existing" }, "tok-bob"), /^Resolved 'existing' to 'Inbox\/existing.md'\.\n\[Open in Obsidian\][\s\S]*old in b/);
+});
+
+test("read_notes keeps images and binary files out of the batch", async () => {
+    const { call, vaults } = setup(DOCS);
+    vaults.b.readNote = async (p: string) => {
+        if (p === "doc.pdf") throw new Error("Not a text file: doc.pdf.");
+        return null;
+    };
+    const out = await call("read_notes", { paths: ["img/pic.png", "doc.pdf"] }, "tok-bob");
+    assert.match(out, /## img\/pic.png\n\nImage: use read_note to view it\./);
+    assert.match(out, /## doc.pdf\n\nNot a text file: doc.pdf\./);
+});
+
+test("a connection pinned to one vault sees and reaches only that vault", async () => {
+    const { server, vaults } = setup(DOCS);
+    const pinned = (tool: string, args: Record<string, unknown>) =>
+        server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken("tok-alice"), identity: { sub: "x" }, vault: "a" } });
+    const list = await pinned("list_vaults", {});
+    assert.match(list, /- a — A/);
+    assert.doesNotMatch(list, /- b/);
+    assert.match(await pinned("write_note", { path: "x.md", content: "hi" }), /Note saved/, "no vault argument needed");
+    assert.match(await pinned("read_note", { vault: "b", path: "Inbox/existing.md" }), /limited to vault 'a'/);
+    assert.deepEqual(vaults.a.calls, [["x.md", "hi"]]);
 });

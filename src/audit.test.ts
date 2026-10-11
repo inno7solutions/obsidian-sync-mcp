@@ -151,16 +151,17 @@ test("formatAuditLine: a note body never appears in the serialized line", () => 
 
 test("makeAuditLogger: disabled logger is a no-op", () => {
     let calls = 0;
-    const logger = makeAuditLogger({ vault: "V", enabled: false, sink: () => calls++ });
+    const logger = makeAuditLogger({ enabled: false, sink: () => calls++ });
     assert.equal(logger.enabled, false);
-    logger.record({ tool: "read_note", args: {}, session: {}, outcome: "ok", ms: 1 });
+    logger.record({ vault: "V", tool: "read_note", args: {}, session: {}, outcome: "ok", ms: 1 });
     assert.equal(calls, 0);
 });
 
 test("makeAuditLogger: enabled logger emits one line per call to the sink", () => {
     const lines: string[] = [];
-    const logger = makeAuditLogger({ vault: "V", enabled: true, sink: (l) => lines.push(l) });
+    const logger = makeAuditLogger({ enabled: true, sink: (l) => lines.push(l) });
     logger.record({
+        vault: "V",
         tool: "delete_note",
         args: { path: "a.md" },
         session: { identity: { sub: "u1", email: "j@x.com" } },
@@ -176,12 +177,11 @@ test("makeAuditLogger: enabled logger emits one line per call to the sink", () =
 
 test("makeAuditLogger: a throwing sink never propagates to the caller", () => {
     const logger = makeAuditLogger({
-        vault: "V",
         enabled: true,
         sink: () => {
             throw new Error("disk full");
         },
     });
     // Must not throw — auditing cannot break a tool call.
-    assert.doesNotThrow(() => logger.record({ tool: "read_note", args: {}, session: {}, outcome: "ok", ms: 1 }));
+    assert.doesNotThrow(() => logger.record({ vault: "V", tool: "read_note", args: {}, session: {}, outcome: "ok", ms: 1 }));
 });

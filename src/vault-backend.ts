@@ -15,7 +15,12 @@ export interface NoteListing {
 export interface VaultBackend {
     init(): Promise<void>;
     close(): Promise<void>;
+    /** Text content, null if missing. Throws for binary files. */
     readNote(path: string): Promise<string | null>;
+    /** Bytes of a file, or only its size when larger than maxBytes; null if missing. */
+    readBinary(path: string, maxBytes: number): Promise<{ size: number; bytes?: Uint8Array } | null>;
+    /** Paths whose file name equals `name` (case-insensitive), shortest path first. */
+    findByName(name: string): Promise<string[]>;
     writeNote(path: string, content: string): Promise<boolean>;
     deleteNote(path: string): Promise<boolean>;
     moveNote(from: string, to: string): Promise<boolean>;

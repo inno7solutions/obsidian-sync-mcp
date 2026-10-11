@@ -1,5 +1,20 @@
 # Team Vault Deployment Plan
 
+> **Status 2026-10-11:** the multi-vault part of this plan (§4, Phase 8) is superseded by the
+> registry + admin UI design on branch `feat/multi-vault-admin`: one MCP process serves many
+> vaults, users get per-user CouchDB accounts and MCP tokens, and IdP/POLICY/password modes are
+> removed. See README "How it works".
+>
+> Read the rest as history. Files it cites were removed on that branch: `src/auth*.ts`,
+> `src/token-store.ts`, `src/host-guard.ts`, `src/vault-local.ts`, `test/*e2e*`, `deploy/mcp-only/`,
+> `deploy/mcp-with-db/`, `deploy/setup.sh`, `deploy/generate-setup-uri.mjs` and the root
+> `docker-compose.yml`. Env vars `IDP_*`, `POLICY`, `READ_ONLY`, `WRITE_FOLDERS`, `VAULT_NAME`
+> and `COUCHDB_PASSPHRASE` no longer exist; per-vault access is a registry grant. Phase 4's
+> "dedicated CouchDB user for MCP" is done (`mcp-service`, a plain member of each vault database),
+> and the secrets split into `REGISTRY_KEY` (vault passphrases, admin + MCP) and `CREDENTIALS_KEY`
+> (users' CouchDB passwords, admin only). Current deployment: `deploy/team/`, local testing:
+> `deploy/local-test/`.
+
 How to take obsidian-sync-mcp from a single-user server to a supportable internal
 multi-user deployment.
 
