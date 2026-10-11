@@ -1,7 +1,8 @@
 /**
  * Index for vault notes.
  *
- * Tracks paths, mtimes, tags, links, backlinks, and note text for full-text search.
+ * Tracks paths, mtimes, tags, links, backlinks, and note text for full-text search,
+ * plus attachment metadata (path, mtime, size — never content).
  * Persists to disk (encrypted if passphrase is set).
  */
 
@@ -9,19 +10,23 @@ import { readFile, writeFile, mkdir, chmod } from "fs/promises";
 import { dirname } from "path";
 import { parseFrontmatterAndLinks } from "./parse.js";
 import { seal as encrypt, open as decrypt } from "./secret-box.js";
+import type { FileMeta } from "./vault-backend.js";
 
 /** Bump when the persisted shape changes; an older file is ignored and the index rebuilds from CouchDB. */
-const FORMAT_VERSION = 2;
+const FORMAT_VERSION = 3;
 
 export interface SearchHit {
     path: string;
     mtime: number;
     matches: number;
     snippet: string;
+    /** Set for attachments, which match by path only. */
+    size?: number;
 }
 
 export class SearchIndex {
     private contents = new Map<string, string>();
+    private files = new Map<string, FileMeta>();
     private mtimes = new Map<string, number>();
     private tags = new Map<string, string[]>();
     private links = new Map<string, string[]>();
@@ -49,6 +54,9 @@ export class SearchIndex {
             if (data.version !== FORMAT_VERSION) return false;
             for (const [path, c] of Object.entries(data.contents ?? {})) {
                 this.contents.set(path, c as string);
+            }
+            for (const [path, f] of Object.entries(data.files ?? {})) {
+                this.files.set(path, f as FileMeta);
             }
             for (const [path, mtime] of Object.entries(data.mtimes ?? {})) {
                 this.mtimes.set(path, mtime as number);
@@ -83,6 +91,7 @@ export class SearchIndex {
             let data = JSON.stringify({
                 version: FORMAT_VERSION,
                 contents: Object.fromEntries(this.contents),
+                files: Object.fromEntries(this.files),
                 mtimes: Object.fromEntries(this.mtimes),
                 tags: Object.fromEntries(this.tags),
                 links: Object.fromEntries(this.links),
@@ -199,8 +208,27 @@ export class SearchIndex {
             if (!allFound) continue;
             hits.push({ path, mtime, matches, snippet: first === -1 ? "" : snippetAt(body, first) });
         }
+        for (const { path, mtime, size } of this.listFiles(folder)) {
+            const lowerPath = path.toLowerCase();
+            if (terms.every((t) => lowerPath.includes(t))) hits.push({ path, mtime, matches: 5 * terms.length, snippet: "", size });
+        }
         hits.sort((a, b) => b.matches - a.matches || b.mtime - a.mtime);
         return { hits: hits.slice(0, limit), total: hits.length };
+    }
+
+    /** Record an attachment's metadata; null removes it. */
+    setFile(path: string, meta: FileMeta | null): void {
+        if (meta) this.files.set(path, meta);
+        else this.files.delete(path);
+    }
+
+    /** Attachments, optionally filtered by folder prefix, sorted by path. */
+    listFiles(folder?: string): Array<{ path: string } & FileMeta> {
+        const prefix = folder && !folder.endsWith("/") ? folder + "/" : folder;
+        return [...this.files]
+            .filter(([p]) => !prefix || p.startsWith(prefix))
+            .map(([path, f]) => ({ path, ...f }))
+            .sort((a, b) => a.path.localeCompare(b.path));
     }
 
     /** Get mtime for a path. */
@@ -251,6 +279,7 @@ export class SearchIndex {
     clear(): void {
         const paths = Array.from(this.knownPaths);
         for (const p of paths) this.remove(p);
+        this.files.clear();
         this._since = "";
     }
 

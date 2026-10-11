@@ -34,6 +34,8 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
 /** Base64 adds a third, so this keeps a returned image under the common 5 MB limit. */
 const MAX_IMAGE_BYTES = 3_750_000;
 
+const kb = (bytes: number) => (bytes < 1e3 ? `${bytes} B` : bytes < 1e6 ? `${Math.round(bytes / 1e3)} KB` : `${(bytes / 1e6).toFixed(1)} MB`);
+
 const vaultParam = z
     .string()
     .optional()
@@ -178,7 +180,7 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
     server.addTool({
         name: "search_notes",
         description:
-            "Full-text search across note paths and contents (case-insensitive; every word must appear). Returns the best matches with a snippet and a deep link. Use read_note or read_notes to see whole notes.",
+            "Full-text search across note paths and contents (case-insensitive; every word must appear). Attachments match by file name. Returns the best matches with a snippet and a deep link. Use read_note or read_notes to see whole notes.",
         parameters: z.object({
             vault: vaultParam,
             query: z.string().min(1).describe("Words to find, e.g. 'budget review'"),
@@ -190,7 +192,9 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
             if ("error" in t) return t.error;
             const { hits, total } = t.index.search(args.query, args.folder, args.limit ?? 20);
             if (total === 0) return `No notes match: ${args.query}`;
-            const lines = hits.map((h) => `- [${h.path}](${link(t, h.path)})${h.snippet ? `\n  > ${h.snippet}` : ""}`);
+            const lines = hits.map(
+                (h) => `- [${h.path}](${link(t, h.path)})${h.size !== undefined ? ` (attachment, ${kb(h.size)})` : ""}${h.snippet ? `\n  > ${h.snippet}` : ""}`,
+            );
             if (total > hits.length) lines.push(`\n... and ${total - hits.length} more. Add words, a folder or a higher limit to narrow results.`);
             return lines.join("\n");
         },
@@ -248,15 +252,22 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
                 .number()
                 .optional()
                 .describe("Max number of notes to return. Default 100."),
+            include_attachments: z
+                .boolean()
+                .optional()
+                .describe("Also list attachments (images, PDFs, …) with their size. Default false. Tag filters never match attachments."),
         }),
         execute: async (args, ctx) => {
             const t = await target(args, ctx);
             if ("error" in t) return t.error;
-            const { folder, name, tag, sort_by, modified_after, limit } = args;
+            const { folder, name, tag, sort_by, modified_after, limit, include_attachments } = args;
             // Use search index (works with encrypted vaults), fall back to vault
-            let notes = t.index.listWithMtime(folder);
+            let notes: Array<{ path: string; mtime: number; size?: number }> = t.index.listWithMtime(folder);
             if (notes.length === 0) {
                 notes = await t.vault.listNotesWithMtime(folder);
+            }
+            if (include_attachments) {
+                notes = [...notes, ...t.index.listFiles(folder)].sort((a, b) => a.path.localeCompare(b.path));
             }
             if (name) {
                 const lower = name.toLowerCase();
@@ -281,7 +292,7 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
             const capped = notes.slice(0, cap);
             const lines = capped.map((n) => {
                 const date = n.mtime ? new Date(n.mtime).toISOString().slice(0, 16) : "";
-                return `- ${date} [${n.path}](${link(t, n.path)})`;
+                return `- ${date} [${n.path}](${link(t, n.path)})${n.size !== undefined ? ` (attachment, ${kb(n.size)})` : ""}`;
             });
             if (total > cap) {
                 lines.push(`\n... and ${total - cap} more. Use a folder filter or limit to narrow results.`);
@@ -293,7 +304,7 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
     server.addTool({
         name: "list_folders",
         description:
-            "List all folders in a vault. Use this to discover folder names before writing or listing notes. Returns the folder tree with note counts.",
+            "List all folders in a vault. Use this to discover folder names before writing or listing notes. Returns the folder tree with note and attachment counts.",
         parameters: z.object({ vault: vaultParam }),
         execute: async (args, ctx) => {
             const t = await target(args, ctx);
@@ -302,27 +313,27 @@ export function registerTools(server: FastMCP, resolver: VaultResolver, audit?: 
             if (paths.length === 0) {
                 paths = await t.vault.listNotes();
             }
-            const folders = new Map<string, number>();
-            for (const p of paths) {
+            const folders = new Map<string, { notes: number; files: number }>();
+            const count = (p: string, kind: "notes" | "files") => {
                 const lastSlash = p.lastIndexOf("/");
-                if (lastSlash === -1) {
-                    folders.set("(root)", (folders.get("(root)") ?? 0) + 1);
-                } else {
-                    const folder = p.slice(0, lastSlash);
-                    folders.set(folder, (folders.get(folder) ?? 0) + 1);
-                    // Ensure all parent folders appear in the list
-                    let parent = folder;
-                    while (parent.includes("/")) {
-                        parent = parent.slice(0, parent.lastIndexOf("/"));
-                        if (!folders.has(parent)) folders.set(parent, 0);
-                    }
+                const folder = lastSlash === -1 ? "(root)" : p.slice(0, lastSlash);
+                const c = folders.get(folder) ?? { notes: 0, files: 0 };
+                c[kind]++;
+                folders.set(folder, c);
+                // Ensure all parent folders appear in the list
+                let parent = folder;
+                while (parent.includes("/")) {
+                    parent = parent.slice(0, parent.lastIndexOf("/"));
+                    if (!folders.has(parent)) folders.set(parent, { notes: 0, files: 0 });
                 }
-            }
+            };
+            for (const p of paths) count(p, "notes");
+            for (const f of t.index.listFiles()) count(f.path, "files");
             if (folders.size === 0) {
                 return "Vault is empty.";
             }
             const sorted = [...folders.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-            return sorted.map(([f, count]) => `- ${f} (${count} notes)`).join("\n");
+            return sorted.map(([f, c]) => `- ${f} (${c.notes} notes${c.files ? `, ${c.files} attachments` : ""})`).join("\n");
         },
     });
 

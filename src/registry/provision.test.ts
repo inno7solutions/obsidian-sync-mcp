@@ -53,3 +53,11 @@ test("URI passphrase carries 128 random bits", () => {
     assert.match(uriPassphrase(), /^[A-Za-z0-9_-]{22}$/);
     assert.notEqual(uriPassphrase(), uriPassphrase());
 });
+
+test("issueToken: scope needs a grant on that vault and is stored on the token", async () => {
+    const { p, docs } = setup(base());
+    await assert.rejects(p.issueToken("bob", "x", "a"), /no grant on a/);
+    await p.issueToken("alice", "x", "a");
+    const t = Object.values(docs).find((d: any) => d.type === "token" && d.label === "x") as any;
+    assert.equal(t.vault, "a");
+});

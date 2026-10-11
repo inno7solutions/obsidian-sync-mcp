@@ -232,3 +232,26 @@ describe("SearchIndex.search", () => {
         assert.equal(d.since, "", "old format forces a rebuild from the start");
     });
 });
+
+describe("SearchIndex attachments", () => {
+    it("tracks attachment metadata, finds it by name, survives save/load, and clears", async () => {
+        const file = join(tmpDir, "files.json");
+        const i = new SearchIndex(file);
+        i.update("notes/a.md", "see ![[diagram.png]]", 1);
+        i.setFile("img/diagram.png", { mtime: 5, size: 2048 });
+        i.setFile("img/old.png", { mtime: 1, size: 1 });
+        i.setFile("img/old.png", null);
+        assert.deepEqual(i.listFiles(), [{ path: "img/diagram.png", mtime: 5, size: 2048 }]);
+        assert.deepEqual(i.listFiles("notes"), []);
+        assert.equal(i.listWithMtime().length, 1, "notes listing stays markdown-only");
+        const hit = i.search("diagram").hits.find((h) => h.path === "img/diagram.png");
+        assert.equal(hit?.size, 2048);
+        assert.deepEqual(i.getBacklinks("img/diagram.png"), ["notes/a.md"], "embeds count as backlinks");
+        await i.saveToDisk();
+        const j = new SearchIndex(file);
+        await j.loadFromDisk();
+        assert.equal(j.listFiles().length, 1);
+        j.clear();
+        assert.equal(j.listFiles().length, 0);
+    });
+});

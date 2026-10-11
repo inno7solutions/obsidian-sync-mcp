@@ -11,6 +11,7 @@ import { SearchIndex } from "./search.js";
 import { applyIndexChange } from "./index-sync.js";
 import { open } from "./secret-box.js";
 import type { Snapshot, VaultRecord } from "./registry/model.js";
+import type { FileMeta } from "./vault-backend.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
@@ -89,12 +90,15 @@ export class VaultManager {
         const index = new SearchIndex(join(this.cfg.dataDir, v.slug, "search-index.json"), passphrase);
         await index.loadFromDisk();
         catchUpIndex(v.slug, vault, index).catch((err) => console.error(`Index rebuild for '${v.slug}' failed:`, err));
-        vault.watchChanges((path, content, mtime, seq) => {
-            if (debugLogging) console.log(`[debug] ${v.slug}: ${content === null ? "delete" : "change"} ${path}`);
-            // content === "" is an empty-but-present note: index it, don't drop it.
-            applyIndexChange(index, path, content, mtime);
-            if (seq) index.since = String(seq);
-        });
+        vault.watchChanges(
+            (path, content, mtime, seq) => {
+                if (debugLogging) console.log(`[debug] ${v.slug}: ${content === null ? "delete" : "change"} ${path}`);
+                // content === "" is an empty-but-present note: index it, don't drop it.
+                applyIndexChange(index, path, content, mtime);
+                if (seq) index.since = String(seq);
+            },
+            (path, meta) => index.setFile(path, meta),
+        );
         console.log(`Vault '${v.slug}' ready (db ${v.db}${passphrase ? ", E2EE" : ""}).`);
         return { vault, index };
     }
@@ -122,18 +126,19 @@ async function catchUpIndex(slug: string, vault: Vault, index: SearchIndex): Pro
         changes++;
         applyIndexChange(index, path, content, mtime);
     };
+    const onFile = (path: string, meta: FileMeta | null) => index.setFile(path, meta);
     const onBatch = async (batchSince: string, processed: number) => {
         index.since = batchSince;
         await index.saveToDisk();
         if (debugLogging) console.log(`[debug] ${slug}: checkpoint ${processed} changes, ${index.size} notes.`);
     };
     try {
-        index.since = await vault.catchUp(index.since || "0", onChange, onBatch);
+        index.since = await vault.catchUp(index.since || "0", onChange, onBatch, onFile);
     } catch (err) {
         console.warn(`${slug}: catch-up failed (${err}), rebuilding index from scratch...`);
         index.clear();
         changes = 0;
-        index.since = await vault.catchUp("0", onChange, onBatch);
+        index.since = await vault.catchUp("0", onChange, onBatch, onFile);
     }
     console.log(`${slug}: search index ${changes > 0 ? `synced ${changes} changes in ${((performance.now() - start) / 1000).toFixed(1)}s` : "up to date"} (${index.size} notes).`);
     await index.saveToDisk();

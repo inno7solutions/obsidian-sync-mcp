@@ -51,6 +51,8 @@ export interface TokenRecord {
     username: string;
     label: string;
     createdAt: string;
+    /** Set at issue time: the token reaches only this vault. Absent = all the user's granted vaults. */
+    vault?: string;
 }
 
 export type RegistryDoc = VaultRecord | UserRecord | GrantRecord | TokenRecord;

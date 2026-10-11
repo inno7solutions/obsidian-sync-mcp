@@ -294,18 +294,20 @@ ${rows.map(([k, v]) => `<label>${h(k)}</label><pre>${h(v)}</pre>`).join("")}${ex
         const u = c.req.param("u")!;
         const f = await form(c);
         try {
-            const token = await cfg.provisioner.issueToken(u, f.label ?? "");
-            cfg.audit.admin("token_issue", `${u}:${f.label ?? ""}`);
+            const scope = f.vault?.trim() || undefined;
+            const token = await cfg.provisioner.issueToken(u, f.label ?? "", scope);
+            cfg.audit.admin("token_issue", `${u}:${f.label ?? ""}${scope ? `@${scope}` : ""}`);
             const add = (name: string, url: string) => `claude mcp add --transport http ${name} "${url}" --header "Authorization: Bearer ${token}"`;
-            const perVault = userVaults(await cfg.store.load(), u).map((v): [string, string] => [
+            const vaults = userVaults(await cfg.store.load(), u).filter((v) => !scope || v.vault.slug === scope);
+            const perVault = vaults.map((v): [string, string] => [
                 `Claude Code — only vault ${v.vault.slug}`,
                 add(mcpServerName(cfg.publicMcpUrl, v.vault.slug), singleVaultUrl(cfg.publicMcpUrl, v.vault.slug)),
             ]);
             return secretPage(
                 c,
                 "MCP token issued",
-                [["Token", token], ["Claude Code — all vaults", add(mcpServerName(cfg.publicMcpUrl), cfg.publicMcpUrl)], ...perVault, ["MCP URL", cfg.publicMcpUrl]],
-                "Send it to the user over a private channel. A single-vault command mounts just that vault as its own MCP server; run it inside a project and Claude Code keeps it to that project (default local scope).",
+                [["Token", token], ...(scope ? [] : [["Claude Code — all vaults", add(mcpServerName(cfg.publicMcpUrl), cfg.publicMcpUrl)] as [string, string]]), ...perVault, ["MCP URL", scope ? singleVaultUrl(cfg.publicMcpUrl, scope) : cfg.publicMcpUrl]],
+                `${scope ? `This token only reaches vault ${h(scope)}. ` : ""}Send it to the user over a private channel. A single-vault command mounts just that vault as its own MCP server; run it inside a project and Claude Code keeps it to that project (default local scope).`,
                 `/users/${u}`,
             );
         } catch (err) {
@@ -422,7 +424,7 @@ function userPage(s: Snapshot, username: string, hidden: string): string {
     const tokenRows = [...s.tokens.values()]
         .filter((t) => t.username === username)
         .map(
-            (t) => `<tr><td>${h(t.label)}</td><td>${h(t.createdAt.slice(0, 16).replace("T", " "))}</td><td><code>${h(t.hash.slice(0, 12))}…</code></td>
+            (t) => `<tr><td>${h(t.label)}</td><td>${t.vault ? h(t.vault) : '<span class="muted">all vaults</span>'}</td><td>${h(t.createdAt.slice(0, 16).replace("T", " "))}</td><td><code>${h(t.hash.slice(0, 12))}…</code></td>
 <td><form method="post" action="${base}/tokens/${h(t.hash)}/revoke">${hidden}<button class="danger">Revoke</button></form></td></tr>`,
         )
         .join("");
@@ -436,8 +438,11 @@ function userPage(s: Snapshot, username: string, hidden: string): string {
 <form method="post" action="${base}/reset-password">${hidden}<button class="danger">Reset CouchDB password</button></form></p></section>
 <section><h2>Vault access</h2><p class="muted">One CouchDB account per user; a grant adds it to the vault database. Read-only limits MCP only — LiveSync can still write.</p>
 <div class="scroll"><table><tr><th>Vault</th><th>Access</th><th>Obsidian</th></tr>${grantRows || '<tr><td colspan="3" class="muted">No vaults yet.</td></tr>'}</table></div></section>
-<section><h2>MCP tokens</h2><div class="scroll"><table><tr><th>Label</th><th>Created</th><th>Id</th><th></th></tr>${tokenRows || '<tr><td colspan="4" class="muted">No tokens.</td></tr>'}</table></div>
-<form method="post" action="${base}/tokens" class="grid" style="margin-top:12px">${hidden}<div><label for="l">Label</label><input id="l" name="label" placeholder="e.g. laptop Claude Code" required></div><div><button>Issue token</button></div></form></section>
+<section><h2>MCP tokens</h2><div class="scroll"><table><tr><th>Label</th><th>Scope</th><th>Created</th><th>Id</th><th></th></tr>${tokenRows || '<tr><td colspan="5" class="muted">No tokens.</td></tr>'}</table></div>
+<form method="post" action="${base}/tokens" class="grid" style="margin-top:12px">${hidden}<div><label for="l">Label</label><input id="l" name="label" placeholder="e.g. laptop Claude Code" required></div>
+<div><label for="ts">Scope (fixed once issued)</label><select id="ts" name="vault"><option value="">All granted vaults</option>${userVaults(s, username)
+        .map((v) => `<option value="${h(v.vault.slug)}">Only ${h(v.vault.slug)}</option>`)
+        .join("")}</select></div><div><button>Issue token</button></div></form></section>
 <section><h2>Delete user</h2><form method="post" action="${base}/delete" class="grid">${hidden}
 <div><label for="c">Type “${h(username)}” to confirm</label><input id="c" name="confirm" required></div><div><button class="danger">Delete user, grants and tokens</button></div></form></section>`;
 }

@@ -14,6 +14,7 @@ const docs = [
     { type: "grant", username: "eve", vault: "a", mode: "read", folders: [] },
     { type: "token", hash: hashToken("good"), username: "alice", label: "", createdAt: "" },
     { type: "token", hash: hashToken("disabled-user"), username: "eve", label: "", createdAt: "" },
+    { type: "token", hash: hashToken("scoped"), username: "alice", label: "", createdAt: "", vault: "a" },
 ];
 const s = buildSnapshot(docs);
 
@@ -74,4 +75,12 @@ test("authenticate: ?vault= pins the session; an unreachable vault fails the con
     for (const url of ["/mcp?vault=old", "/mcp?vault=nope"]) {
         await assert.rejects(auth(req(url)), (r: unknown) => r instanceof Response && r.status === 403, url);
     }
+});
+
+test("authenticate: a vault-scoped token is pinned to its vault and refuses any other", async () => {
+    const auth = makeAuthenticate(() => s);
+    const req = (url: string) => ({ url, headers: { authorization: "Bearer scoped" } }) as any;
+    assert.equal((await auth(req("/mcp"))).vault, "a");
+    assert.equal((await auth(req("/mcp?vault=a"))).vault, "a");
+    await assert.rejects(auth(req("/mcp?vault=old")), (r: unknown) => r instanceof Response && r.status === 403);
 });

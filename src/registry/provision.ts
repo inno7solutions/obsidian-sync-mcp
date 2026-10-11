@@ -204,10 +204,13 @@ export class Provisioner {
 
     // --- MCP tokens ---
 
-    /** Returns the token; only its hash is stored. */
-    async issueToken(username: string, label: string): Promise<string> {
-        const user = (await this.cfg.store.load()).users.get(username);
-        if (!user) throw new Error(`Unknown user '${username}'.`);
+    /** Returns the token; only its hash is stored. `vault` scopes it to one granted vault, for good. */
+    async issueToken(username: string, label: string, vault?: string): Promise<string> {
+        const s = await this.cfg.store.load();
+        if (!s.users.has(username)) throw new Error(`Unknown user '${username}'.`);
+        if (vault && !s.grants.some((g) => g.username === username && g.vault === vault)) {
+            throw new Error(`${username} has no grant on ${vault}; grant it before issuing a token for it.`);
+        }
         const token = newToken();
         const hash = hashToken(token);
         await this.cfg.store.put(docId.token(hash), {
@@ -216,6 +219,7 @@ export class Provisioner {
             username,
             label: label.trim() || "token",
             createdAt: new Date().toISOString(),
+            ...(vault ? { vault } : {}),
         });
         return token;
     }

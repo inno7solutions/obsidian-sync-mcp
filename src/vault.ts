@@ -10,7 +10,7 @@ import type { MetaEntry } from "../lib/livesync-commonlib/src/API/DirectFileMani
 import { isPathProbablyObfuscated, decrypt } from "octagonal-wheels/encryption/encryption";
 import { clearHandlers } from "../lib/livesync-commonlib/src/replication/SyncParamsHandler.ts";
 import { parseFrontmatterAndLinks } from "./parse.js";
-import type { VaultBackend, NoteInfo, NoteListing } from "./vault-backend.js";
+import type { VaultBackend, NoteInfo, NoteListing, FileListener } from "./vault-backend.js";
 import { deriveContent } from "./index-sync.js";
 import { classifyIds, type IdFormat } from "./id-format.js";
 
@@ -126,6 +126,12 @@ export class Vault implements VaultBackend {
         return (meta.path ?? "").endsWith(".md");
     }
 
+    /** Report an attachment from its metadata doc alone, so its chunks are never loaded. Skips LiveSync's internal docs. */
+    private static reportFile(meta: any, path: string, onFile?: FileListener): void {
+        if (!onFile || !path || /^(h|i|ix|ps):/.test(meta._id ?? "")) return;
+        onFile(path, meta.deleted || meta._deleted ? null : { mtime: meta.mtime ?? 0, size: meta.size ?? 0 });
+    }
+
     private static docToChange(doc: any, callback: (path: string, content: string | null, mtime?: number, seq?: string | number) => void, seq?: string | number) {
         const path = doc.path ?? "";
         if (!path.endsWith(".md")) return;
@@ -138,6 +144,7 @@ export class Vault implements VaultBackend {
         since: string,
         callback: (path: string, content: string | null, mtime?: number) => void,
         onBatch?: (since: string, processed: number) => Promise<void>,
+        onFile?: FileListener,
     ): Promise<string> {
         // Paginate _changes in batches to limit memory usage.
         const BATCH_SIZE = 50;
@@ -165,7 +172,10 @@ export class Vault implements VaultBackend {
                 if (isPathProbablyObfuscated(path) && this.passphrase) {
                     try { path = await decrypt(path, this.passphrase, false); } catch { continue; }
                 }
-                if (!path.endsWith(".md") && !meta.deleted) continue;
+                if (!path.endsWith(".md")) {
+                    Vault.reportFile(meta, path, onFile);
+                    continue;
+                }
                 const doc = await this.manipulator.getByMeta(meta).catch(() => null);
                 if (doc) Vault.docToChange(doc, callback);
             }
@@ -189,11 +199,16 @@ export class Vault implements VaultBackend {
         return currentSince;
     }
 
-    watchChanges(callback: (path: string, content: string | null, mtime?: number, seq?: string | number) => void): void {
-        // catchUp already set this.manipulator.since to the right point
+    watchChanges(callback: (path: string, content: string | null, mtime?: number, seq?: string | number) => void, onFile?: FileListener): void {
+        // catchUp already set this.manipulator.since to the right point.
+        // The filter sees the (decrypted) metadata doc before chunks load: attachments are recorded there and skipped.
         this.manipulator.beginWatch(
             (doc, seq) => Vault.docToChange(doc, callback, seq),
-            Vault.mdFilter,
+            (meta) => {
+                if (Vault.mdFilter(meta)) return true;
+                Vault.reportFile(meta, meta.path ?? "", onFile);
+                return false;
+            },
         );
     }
 
@@ -281,6 +296,11 @@ export class Vault implements VaultBackend {
 
     async getMetadata(path: string): Promise<NoteInfo | null> {
         this.validatePath(path);
+        // Attachments: answer from metadata alone, without loading (possibly large) chunks.
+        const meta = await this.manipulator.get(path as FilePathWithPrefix, true);
+        if (meta && !isTextDocument(meta as any)) {
+            return { path, size: meta.size, ctime: meta.ctime, mtime: meta.mtime, frontmatter: {}, tags: [], links: [] };
+        }
         const entry = await this.manipulator.get(path as FilePathWithPrefix);
         if (!entry) return null;
         const content = "data" in entry && Array.isArray(entry.data) ? entry.data.join("") : "";

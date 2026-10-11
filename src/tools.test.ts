@@ -65,6 +65,7 @@ const searchIndex = {
     remove() {},
     listWithMtime: () => [],
     listPaths: () => [],
+    listFiles: () => [],
     getTags: () => [],
     listAllTags: () => [],
     getBacklinks: () => [],
@@ -253,4 +254,36 @@ test("a connection pinned to one vault sees and reaches only that vault", async 
     assert.match(await pinned("write_note", { path: "x.md", content: "hi" }), /Note saved/, "no vault argument needed");
     assert.match(await pinned("read_note", { vault: "b", path: "Inbox/existing.md" }), /limited to vault 'a'/);
     assert.deepEqual(vaults.a.calls, [["x.md", "hi"]]);
+});
+
+test("a vault-scoped token stays in its vault even on an unpinned session", async () => {
+    const docs = [...DOCS, { ...token("tok-scoped", "alice"), vault: "a" }];
+    const { call } = setup(docs);
+    const list = await call("list_vaults", {}, "tok-scoped");
+    assert.match(list, /- a — A/);
+    assert.doesNotMatch(list, /- b/);
+    assert.match(await call("read_note", { vault: "b", path: "Inbox/existing.md" }, "tok-scoped"), /limited to vault 'a'/);
+});
+
+test("list_notes and list_folders include attachments on request", async () => {
+    const { call } = setup(DOCS);
+    const saved = { listWithMtime: searchIndex.listWithMtime, listPaths: searchIndex.listPaths, listFiles: searchIndex.listFiles };
+    Object.assign(searchIndex, {
+        listWithMtime: () => [{ path: "Inbox/a.md", mtime: 0 }],
+        listPaths: () => ["Inbox/a.md"],
+        listFiles: () => [
+            { path: "Inbox/pic.png", mtime: 0, size: 2_500_000 },
+            { path: "Inbox/tiny.png", mtime: 0, size: 70 },
+        ],
+    });
+    try {
+        const plain = await call("list_notes", {}, "tok-bob");
+        assert.doesNotMatch(plain, /pic.png/);
+        const all = await call("list_notes", { include_attachments: true }, "tok-bob");
+        assert.match(all, /\[Inbox\/pic.png\]\([^)]*\) \(attachment, 2.5 MB\)/);
+        assert.match(all, /\[Inbox\/tiny.png\]\([^)]*\) \(attachment, 70 B\)/);
+        assert.match(await call("list_folders", {}, "tok-bob"), /- Inbox \(1 notes, 2 attachments\)/);
+    } finally {
+        Object.assign(searchIndex, saved);
+    }
 });

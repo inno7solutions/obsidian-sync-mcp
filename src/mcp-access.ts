@@ -8,6 +8,7 @@
  *
  * `/mcp?vault=<id>` pins a connection to one vault, so a client can mount a
  * single vault as its own MCP server (e.g. project knowledge in a coding session).
+ * A token issued for one vault is always pinned to it, whatever the URL says.
  */
 
 import type { IncomingMessage } from "http";
@@ -20,7 +21,7 @@ export type McpSession = {
     authenticated: true;
     tokenHash: string;
     identity: { sub: string; email: string };
-    /** Vault this connection is pinned to via `?vault=`; absent = all granted vaults. */
+    /** Vault this connection is pinned to (token scope or `?vault=`); absent = all granted vaults. */
     vault?: string;
 };
 
@@ -35,7 +36,11 @@ export function makeAuthenticate(snapshot: () => Snapshot) {
         if (!token || !user || user.disabled) {
             throw new Response("Unauthorized", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
         }
-        const vault = new URL(req.url ?? "/", "http://localhost").searchParams.get("vault")?.trim() || undefined;
+        const requested = new URL(req.url ?? "/", "http://localhost").searchParams.get("vault")?.trim() || undefined;
+        if (token.vault && requested && requested !== token.vault) {
+            throw new Response(`This token is limited to vault '${token.vault}'.`, { status: 403 });
+        }
+        const vault = token.vault ?? requested;
         // Fail the connect, not every later call, when the pinned vault is out of reach.
         if (vault && "error" in pickVault(snapshot(), user.username, vault)) {
             throw new Response(`No access to vault '${vault}'.`, { status: 403 });
@@ -50,6 +55,12 @@ export function sessionUser(s: Snapshot, session: unknown): string | undefined {
     return hash ? s.tokens.get(hash)?.username : undefined;
 }
 
+/** The vault a session may use exclusively: the token's scope, else the `?vault=` pin. */
+function pinOf(s: Snapshot, session: unknown): string | undefined {
+    const ses = session as McpSession | undefined;
+    return (ses?.tokenHash ? s.tokens.get(ses.tokenHash)?.vault : undefined) ?? ses?.vault;
+}
+
 export function makeResolver(snapshot: () => Snapshot, open: (slug: string) => Promise<OpenVault>): VaultResolver {
     const toPicked = (v: { vault: { slug: string; displayName: string; obsidianName: string }; access: PickedVault["access"] }): PickedVault => ({
         slug: v.vault.slug,
@@ -61,14 +72,14 @@ export function makeResolver(snapshot: () => Snapshot, open: (slug: string) => P
         list(session) {
             const s = snapshot();
             const user = sessionUser(s, session);
-            const pinned = (session as McpSession | undefined)?.vault;
+            const pinned = pinOf(s, session);
             return user ? userVaults(s, user).filter((v) => !pinned || v.vault.slug === pinned).map(toPicked) : [];
         },
         pick(session, requested) {
             const s = snapshot();
             const user = sessionUser(s, session);
             if (!user) return { error: "Your access token is no longer valid." };
-            const pinned = (session as McpSession | undefined)?.vault;
+            const pinned = pinOf(s, session);
             if (pinned && requested && requested !== pinned) return { error: `This connection is limited to vault '${pinned}'.` };
             const hit = pickVault(s, user, pinned ?? requested);
             return "error" in hit ? hit : toPicked(hit);
