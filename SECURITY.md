@@ -18,6 +18,113 @@ The server implements a self-contained OAuth 2.1 authorization server with PKCE.
 - **No auth mode** — when `MCP_AUTH_TOKEN` is not set, the server runs without authentication. Intended for local testing or use behind a private network.
 - **Browser-attack protection (no auth mode)** — with no token, the server validates both the HTTP `Host` and `Origin` headers and rejects any request whose host/origin is not `localhost`/`127.0.0.1`/`::1` (extend with `MCP_ALLOWED_HOSTS`, comma-separated). The `Host` check blocks DNS rebinding (CWE-350) — a loopback bind alone does **not** stop this, since the browser sends the attacker's hostname in `Host`. The `Origin` check blocks the simpler variant where a page directly fetches `http://127.0.0.1:<port>/mcp`: that request has a genuine loopback `Host` but carries a cross-origin `Origin`, and the transport's wildcard CORS would otherwise expose the response. Non-browser MCP clients (CLI, desktop apps) send no `Origin`, so they are unaffected. These checks block *browser*-delivered attacks only: a direct non-browser network client can still forge both headers, so on an untrusted network set `MCP_AUTH_TOKEN`. When a token is set, no host/origin check is needed — a bearer token is not attached by browsers.
 
+### Identity-provider OAuth (team mode)
+
+Setting `IDP_PROVIDER` replaces the shared password with OAuth against an
+external identity provider (Entra ID, Google, or any OIDC provider). The server
+runs an OAuth proxy: to MCP clients it is a standards-compliant authorization
+server with dynamic client registration, while the actual login is delegated
+upstream. Mutually exclusive with `MCP_AUTH_TOKEN` — setting both is a fatal
+startup error, because both serve `/oauth/*`.
+
+- **Identity per caller** — `sub`, `email`, `name` and group/role claims are read
+  from the OIDC ID token and attached to the session. The ID token is decoded
+  without signature verification, which is sound only because it never passes
+  through the caller: the client holds a server-issued token, and the ID token is
+  read from server-side storage having arrived over TLS from the IdP's token
+  endpoint. Disabling fastmcp's token swap would invalidate that reasoning.
+- **Access gate** — `IDP_REQUIRED_GROUPS` (any-of) and `IDP_ALLOWED_DOMAINS`
+  (email domain) are enforced on every authentication, and denials are logged
+  with the subject and reason. With neither set, any account the IdP will issue a
+  token for has full vault access; the server warns about this at startup.
+- **Token issuer and audience are `BASE_URL`** — tokens minted by one instance are
+  rejected by another with a different `BASE_URL`, so separate vaults on separate
+  hostnames cannot borrow each other's sessions.
+- **Session keys are derived from `IDP_CLIENT_SECRET`** unless
+  `IDP_JWT_SIGNING_KEY` / `IDP_ENCRYPTION_KEY` are set. This is deliberate:
+  auto-generated keys would rotate on every restart, invalidating all sessions
+  and the persisted token store. Rotating the client secret intentionally ends
+  every session.
+- **Persisted token store** — OAuth state is written to `DATA_DIR/oauth-store.json`
+  with `0600` permissions, so restarts and deploys do not log the team out. The
+  values are encrypted by fastmcp's storage layer before they reach the file.
+- **The IdP client credentials are retrievable** — `/oauth/register` answers any
+  caller with the upstream `client_id` and `client_secret`, which is how the
+  proxy serves clients that expect dynamic registration. Use a dedicated app
+  registration with no permissions beyond `openid`/`profile`/`email` and no
+  client-credentials grant, and treat the secret as exposed to anyone who can
+  reach the port.
+- **Redirect URIs are not restricted by this server** —
+  `IDP_ALLOWED_REDIRECT_URIS` can only add patterns; the underlying check falls
+  back to accepting any HTTPS or loopback URI when no pattern matches. Keep the
+  redirect URI allowlist in the IdP tight, since that is the boundary that holds.
+
+### Local admin fallback
+
+`ADMIN_TOKEN` defines a static bearer that authenticates as a fixed admin
+identity, usable *alongside* `IDP_PROVIDER` (it mounts no routes, so it does not
+collide with the OAuth proxy the way `MCP_AUTH_TOKEN` would). It exists for
+break-glass access when the IdP is unavailable and for non-interactive clients.
+
+- **Constant-time comparison** against `Bearer <ADMIN_TOKEN>`, with a length
+  guard, so the check is not a timing oracle.
+- **Carries an identity**, so admin actions are attributed in the audit log
+  (`ADMIN_EMAIL`), not anonymous.
+- **Bypasses per-caller POLICY** (writes anywhere) but **not** the process-wide
+  `READ_ONLY` / `WRITE_FOLDERS` ceiling — a locked-down container stays locked
+  down.
+- **It is a shared secret with full write access.** Treat it like a root
+  password: long and random, delivered via the secret manager, rotated on
+  exposure, and ideally used only when the IdP path is unavailable.
+
+### Per-user authorization (team mode)
+
+With `IDP_PROVIDER` set, `POLICY` maps each caller's group/role claims to what
+they may write. It is enforced two ways at once:
+
+- **Tool visibility** — a caller who can write nothing does not see the write
+  tools at all. fastmcp evaluates `canAccess` when the session is created and
+  filters the tool set, so a hidden tool answers `MethodNotFound`, not a refusal.
+  This is genuine enforcement, not cosmetic hiding. Because it is evaluated per
+  session, a policy change takes effect for a caller only on their next session
+  (bounded by the access-token lifetime).
+- **Per-path check** — every write additionally re-checks the caller's folder
+  scope at call time (`isWritable`), so folder scoping does not depend on the
+  tool having been hidden.
+
+Two safety properties hold by construction:
+
+- **Default deny.** A configured policy with no rule matching the caller yields
+  read-only. Writing requires a rule that grants it.
+- **The ceiling only removes access.** Effective write scope is the intersection
+  of the caller's policy and the process-wide `READ_ONLY` / `WRITE_FOLDERS`
+  ceiling, so a locked-down container stays locked down regardless of policy.
+  With no `POLICY` set, every authenticated caller gets the ceiling directly —
+  the pre-existing behavior.
+
+Group membership is read from the ID token claims named by `IDP_GROUPS_CLAIM`.
+Reads are **not** scoped: every authenticated caller can read the whole vault
+(see the vault-isolation note under Known limitations).
+
+### Audit logging
+
+Every tool call emits one structured JSON line (`AUDIT_LOG`, on by default) to
+stdout, and optionally to a `0600` file (`AUDIT_LOG_FILE`). It records the actor
+(email or subject id in IdP mode, `anonymous` otherwise), the tool, the outcome
+(`ok` / `denied` / `error`), timing, and session/request ids. `delete_note` and
+`move_note` are flagged `destructive`.
+
+- **Redaction is by allowlist.** Only known-safe argument keys are logged; note
+  bodies (`content`, `old_text`) are recorded as byte lengths, never text, so a
+  future tool parameter cannot leak content by default.
+- **Paths are logged and are sensitive.** In an E2E vault the paths alone reveal
+  its structure, so the audit stream is confidential and should be access-
+  controlled like the vault itself.
+- **Auditing cannot break a tool call.** A failing sink is caught and logged, not
+  propagated.
+- **It is emitted from the tool wrapper, not fastmcp's `onToolCall`**, because
+  that hook does not receive the caller identity.
+
 ### Brute-force protection
 
 - **Rate limiting with exponential backoff** — after 5 failed password attempts, the server locks out for 5 seconds. Each subsequent lockout doubles: 10s, 20s, 40s, 80s, and so on.

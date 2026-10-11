@@ -183,3 +183,75 @@ describe("SearchIndex persistence", () => {
         assert.equal(await idx.loadFromDisk(), false);
     });
 });
+
+describe("SearchIndex.search", () => {
+    const idx = () => {
+        const i = new SearchIndex();
+        i.update("projects/budget.md", "Q3 budget review with Finance.\nBudget is tight.", 1);
+        i.update("daily/2026-10-01.md", "Talked about the budget.", 2);
+        i.update("daily/2026-10-02.md", "Nothing here.", 3);
+        return i;
+    };
+
+    it("needs every term, case-insensitive, ranked by matches", () => {
+        const { hits, total } = idx().search("BUDGET");
+        assert.equal(total, 2);
+        assert.equal(hits[0].path, "projects/budget.md");
+        assert.deepEqual(idx().search("budget finance").hits.map((h) => h.path), ["projects/budget.md"]);
+        assert.equal(idx().search("budget missing").total, 0);
+    });
+
+    it("matches paths, filters by folder, limits, and snippets the first hit", () => {
+        assert.equal(idx().search("2026-10-02").hits[0].path, "daily/2026-10-02.md");
+        assert.deepEqual(idx().search("budget", "daily").hits.map((h) => h.path), ["daily/2026-10-01.md"]);
+        const r = idx().search("budget", undefined, 1);
+        assert.equal(r.hits.length, 1);
+        assert.equal(r.total, 2);
+        assert.match(r.hits[0].snippet, /Q3 budget review/);
+    });
+
+    it("forgets removed notes", () => {
+        const i = idx();
+        i.remove("projects/budget.md");
+        assert.deepEqual(i.search("finance").hits, []);
+    });
+
+    it("persists note text, and ignores an index file from an older format", async () => {
+        const file = join(tmpDir, "fts.json");
+        const b = new SearchIndex(file);
+        b.update("x.md", "hello world", 1);
+        b.since = "7";
+        await b.saveToDisk();
+        const c = new SearchIndex(file);
+        assert.equal(await c.loadFromDisk(), true);
+        assert.equal(c.search("hello").total, 1);
+        const { writeFile } = await import("fs/promises");
+        await writeFile(file, JSON.stringify({ mtimes: { "x.md": 1 }, since: "7" }));
+        const d = new SearchIndex(file);
+        assert.equal(await d.loadFromDisk(), false);
+        assert.equal(d.since, "", "old format forces a rebuild from the start");
+    });
+});
+
+describe("SearchIndex attachments", () => {
+    it("tracks attachment metadata, finds it by name, survives save/load, and clears", async () => {
+        const file = join(tmpDir, "files.json");
+        const i = new SearchIndex(file);
+        i.update("notes/a.md", "see ![[diagram.png]]", 1);
+        i.setFile("img/diagram.png", { mtime: 5, size: 2048 });
+        i.setFile("img/old.png", { mtime: 1, size: 1 });
+        i.setFile("img/old.png", null);
+        assert.deepEqual(i.listFiles(), [{ path: "img/diagram.png", mtime: 5, size: 2048 }]);
+        assert.deepEqual(i.listFiles("notes"), []);
+        assert.equal(i.listWithMtime().length, 1, "notes listing stays markdown-only");
+        const hit = i.search("diagram").hits.find((h) => h.path === "img/diagram.png");
+        assert.equal(hit?.size, 2048);
+        assert.deepEqual(i.getBacklinks("img/diagram.png"), ["notes/a.md"], "embeds count as backlinks");
+        await i.saveToDisk();
+        const j = new SearchIndex(file);
+        await j.loadFromDisk();
+        assert.equal(j.listFiles().length, 1);
+        j.clear();
+        assert.equal(j.listFiles().length, 0);
+    });
+});

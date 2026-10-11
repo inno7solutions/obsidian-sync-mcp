@@ -1,0 +1,20 @@
+# Replace the example hostnames with your own. Caddy fetches and renews Let's
+# Encrypt certificates automatically on first boot (ports 80 + 443 must be
+# reachable from the internet, and DNS must already point here).
+
+# MCP endpoint for AI clients (per-user bearer tokens).
+vault.example.com {
+	reverse_proxy mcp:8787
+}
+
+# CouchDB for Obsidian LiveSync clients (per-user CouchDB accounts).
+couch.example.com {
+	# LiveSync needs only /<db>/... and /_session. Keep Fauxton and the server
+	# admin API off the internet (CouchDB has no login lockout by default).
+	@admin path /_utils* /_node* /_config* /_membership* /_cluster_setup* /_replicate* /_reshard* /_scheduler* /_active_tasks*
+	respond @admin 404
+	reverse_proxy couchdb:5984
+}
+
+# The admin UI is deliberately NOT proxied; reach it via an SSH tunnel to
+# 127.0.0.1:8788 on this host.

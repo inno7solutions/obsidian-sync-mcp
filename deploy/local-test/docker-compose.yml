@@ -1,0 +1,93 @@
+# Local test stack: CouchDB + MCP server + admin UI, built from THIS branch.
+#
+# Same image, two roles:
+#   - admin (ROLE=admin): web UI to manage vaults, users, grants and MCP tokens.
+#     Holds the CouchDB admin credentials. Bound to 127.0.0.1 only.
+#   - mcp   (ROLE=mcp):   the MCP endpoint. Uses the non-admin mcp-service
+#     CouchDB account and per-user bearer tokens from the registry.
+#
+# Prerequisites (run once, from the repo root):
+#   1. Start Docker Desktop.
+#   2. git submodule update --init --recursive     # pulls lib/livesync-commonlib
+#   3. npm ci && npm run build                      # produces ./dist (the image copies it)
+#   4. cp deploy/local-test/.env.example deploy/local-test/.env  and fill it in
+#
+# Then:
+#   docker compose -f deploy/local-test/docker-compose.yml --env-file deploy/local-test/.env up --build -d
+#   open http://localhost:8788  (log in with ADMIN_TOKEN)
+#
+# Tear down (add -v to also wipe the CouchDB + data volumes):
+#   docker compose -f deploy/local-test/docker-compose.yml down
+
+services:
+  couchdb:
+    image: couchdb:3
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5984:5984" # Obsidian LiveSync clients sync against this
+    environment:
+      COUCHDB_USER: ${COUCHDB_ADMIN_USER:-admin}
+      COUCHDB_PASSWORD: ${COUCHDB_ADMIN_PASSWORD:?Set COUCHDB_ADMIN_PASSWORD in .env}
+    volumes:
+      - couchdb_data:/opt/couchdb/data
+      # Two deliberate choices here:
+      #  - NOT :ro — the couchdb entrypoint adjusts ownership of files in
+      #    local.d at startup; a read-only mount makes it exit 1 silently.
+      #  - target name sorts BEFORE docker.ini so couchdb persists its runtime
+      #    config writes (uuid, hashed admin) to the ephemeral docker.ini rather
+      #    than mutating this source file (which would leak a stale admin hash).
+      - ./couchdb-init.ini:/opt/couchdb/etc/local.d/00-livesync.ini
+    healthcheck:
+      # require_valid_user=true means even /_up needs auth, so pass credentials.
+      test: ["CMD-SHELL", "curl -fs -u \"$$COUCHDB_USER:$$COUCHDB_PASSWORD\" http://localhost:5984/_up || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  admin:
+    build:
+      context: ../.. # repo root — uses the existing Dockerfile (copies ./dist)
+      dockerfile: Dockerfile
+    image: obsidian-mcp:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8788"
+    environment:
+      ROLE: admin
+      HOST: 0.0.0.0 # inside the container; the host port above is loopback-only
+      COUCHDB_URL: http://couchdb:5984
+      COUCHDB_ADMIN_USER: ${COUCHDB_ADMIN_USER:-admin}
+      COUCHDB_ADMIN_PASSWORD: ${COUCHDB_ADMIN_PASSWORD}
+      MCP_SERVICE_PASSWORD: ${MCP_SERVICE_PASSWORD:?Set MCP_SERVICE_PASSWORD in .env}
+      REGISTRY_KEY: ${REGISTRY_KEY:?Set REGISTRY_KEY in .env}
+      CREDENTIALS_KEY: ${CREDENTIALS_KEY:?Set CREDENTIALS_KEY in .env}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN in .env}
+      PUBLIC_COUCHDB_URL: ${PUBLIC_COUCHDB_URL:-http://localhost:5984}
+      PUBLIC_MCP_URL: ${PUBLIC_MCP_URL:-http://localhost:8787/mcp}
+      AUDIT_LOG_FILE: /data/admin-audit.jsonl
+    volumes:
+      - mcp_data:/data
+    depends_on:
+      couchdb:
+        condition: service_healthy
+
+  mcp:
+    image: obsidian-mcp:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      ROLE: mcp
+      COUCHDB_URL: http://couchdb:5984
+      MCP_SERVICE_PASSWORD: ${MCP_SERVICE_PASSWORD}
+      REGISTRY_KEY: ${REGISTRY_KEY}
+      DATA_DIR: /data
+      AUDIT_LOG_FILE: /data/audit.jsonl
+    volumes:
+      - mcp_data:/data
+    depends_on:
+      - admin # creates the registry and the mcp-service account
+
+volumes:
+  couchdb_data: {}
+  mcp_data: {}

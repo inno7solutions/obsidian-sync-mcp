@@ -3,7 +3,7 @@
  *
  * With obfuscation on, file entries get hashed `_id`s prefixed `f:` instead of
  * path-based IDs, so a sample of IDs reveals which mode the vault actually
- * uses — regardless of what COUCHDB_OBFUSCATE_PROPERTIES claims.
+ * uses — regardless of what the vault config claims.
  */
 
 export type IdFormat = "obfuscated" | "plain" | "mixed" | "empty";
