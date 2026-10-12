@@ -15,6 +15,15 @@ import type { FileMeta } from "./vault-backend.js";
 /** Bump when the persisted shape changes; an older file is ignored and the index rebuilds from CouchDB. */
 const FORMAT_VERSION = 3;
 
+/**
+ * Where delete_note puts notes. Not Obsidian's `.trash`: LiveSync never syncs dot paths
+ * (unless "sync internal files" is on), so a visible folder is the only one every device gets.
+ */
+export const TRASH = "_trash";
+
+/** Dot folders and files (`.obsidian/`) and the trash are left out of listings and search. */
+export const isHidden = (path: string) => path === TRASH || path.startsWith(`${TRASH}/`) || path.split("/").some((s) => s.startsWith("."));
+
 export interface SearchHit {
     path: string;
     mtime: number;
@@ -27,6 +36,8 @@ export interface SearchHit {
 export class SearchIndex {
     private contents = new Map<string, string>();
     private files = new Map<string, FileMeta>();
+    /** True while the initial catch-up runs: listings and search may be incomplete. */
+    building = false;
     private mtimes = new Map<string, number>();
     private tags = new Map<string, string[]>();
     private links = new Map<string, string[]>();
@@ -168,9 +179,12 @@ export class SearchIndex {
     /** List all indexed paths with mtimes, optionally filtered by folder prefix. */
     listWithMtime(folder?: string): Array<{ path: string; mtime: number }> {
         const prefix = folder && !folder.endsWith("/") ? folder + "/" : folder;
+        // Hidden paths show up only when the caller asks for a hidden folder (e.g. `.trash`).
+        const showHidden = !!prefix && isHidden(prefix);
         const entries = [...this.knownPaths]
             .filter((p) => p.endsWith(".md"))
             .filter((p) => !prefix || p.startsWith(prefix))
+            .filter((p) => showHidden || !isHidden(p))
             .map((p) => ({ path: p, mtime: this.mtimes.get(p) ?? 0 }));
         return entries.sort((a, b) => a.path.localeCompare(b.path));
     }
@@ -216,6 +230,20 @@ export class SearchIndex {
         return { hits: hits.slice(0, limit), total: hits.length };
     }
 
+    /** Every visible note and attachment path. */
+    allPaths(): string[] {
+        return [...this.listPaths(), ...this.listFiles().map((f) => f.path)];
+    }
+
+    /** Notes whose text contains any of `needles` (case-insensitive). */
+    notesContaining(needles: string[]): string[] {
+        const lower = needles.filter(Boolean).map((n) => n.toLowerCase());
+        return this.listPaths().filter((p) => {
+            const body = (this.contents.get(p) ?? "").toLowerCase();
+            return lower.some((n) => body.includes(n));
+        });
+    }
+
     /** Record an attachment's metadata; null removes it. */
     setFile(path: string, meta: FileMeta | null): void {
         if (meta) this.files.set(path, meta);
@@ -225,8 +253,10 @@ export class SearchIndex {
     /** Attachments, optionally filtered by folder prefix, sorted by path. */
     listFiles(folder?: string): Array<{ path: string } & FileMeta> {
         const prefix = folder && !folder.endsWith("/") ? folder + "/" : folder;
+        const showHidden = !!prefix && isHidden(prefix);
         return [...this.files]
             .filter(([p]) => !prefix || p.startsWith(prefix))
+            .filter(([p]) => showHidden || !isHidden(p))
             .map(([path, f]) => ({ path, ...f }))
             .sort((a, b) => a.path.localeCompare(b.path));
     }
@@ -265,7 +295,8 @@ export class SearchIndex {
     /** List all tags across the vault with counts. */
     listAllTags(): Array<{ tag: string; count: number }> {
         const counts = new Map<string, number>();
-        for (const tags of this.tags.values()) {
+        for (const [path, tags] of this.tags) {
+            if (isHidden(path)) continue;
             for (const t of tags) {
                 counts.set(t, (counts.get(t) ?? 0) + 1);
             }

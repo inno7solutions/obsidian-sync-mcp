@@ -2,56 +2,25 @@
  * Parse Obsidian markdown content for frontmatter, tags, and links.
  */
 
+import { readFrontmatter } from "./frontmatter.js";
+
 export interface NoteMetadata {
-    frontmatter: Record<string, string>;
+    frontmatter: Record<string, unknown>;
     tags: string[];
     links: string[];
 }
 
 export function parseFrontmatterAndLinks(content: string): NoteMetadata {
-    const frontmatter: Record<string, any> = {};
+    const frontmatter = readFrontmatter(content);
     const tags = new Set<string>();
     const links: string[] = [];
 
-    // Parse YAML frontmatter
-    if (content.startsWith("---\n")) {
-        const end = content.indexOf("\n---", 4);
-        if (end !== -1) {
-            const yaml = content.slice(4, end);
-            let inTagsList = false;
-            for (const line of yaml.split("\n")) {
-                // Multi-line tags list item: "  - tagname"
-                if (inTagsList) {
-                    const listItem = line.match(/^\s+-\s+(.+)/);
-                    if (listItem) {
-                        const trimmed = listItem[1].trim();
-                        if (trimmed) tags.add(trimmed);
-                        continue;
-                    }
-                    inTagsList = false;
-                }
-
-                const match = line.match(/^(\w[\w-]*)\s*:\s*(.+)/);
-                if (match) {
-                    frontmatter[match[1]] = match[2].trim();
-                }
-                // Frontmatter tags (inline: [a, b] or start of multi-line list)
-                if (/^tags\s*:/.test(line)) {
-                    const value = line.replace(/^tags\s*:\s*/, "").trim();
-                    if (value) {
-                        // Inline: tags: [a, b] or tags: a, b
-                        const tagValues = value.replace(/[[\]]/g, "");
-                        for (const t of tagValues.split(",")) {
-                            const trimmed = t.trim();
-                            if (trimmed) tags.add(trimmed);
-                        }
-                    } else {
-                        // Multi-line list follows
-                        inTagsList = true;
-                    }
-                }
-            }
-        }
+    // Frontmatter tags: a YAML list, or a comma/space separated string.
+    const fmTags = frontmatter.tags ?? frontmatter.tag;
+    const tagList = Array.isArray(fmTags) ? fmTags : typeof fmTags === "string" ? fmTags.split(/[,\s]+/) : [];
+    for (const t of tagList) {
+        const trimmed = String(t ?? "").replace(/^#/, "").trim();
+        if (trimmed) tags.add(trimmed);
     }
 
     // Inline #tags

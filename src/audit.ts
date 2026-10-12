@@ -28,6 +28,11 @@ const ALLOWED_ARG_KEYS = [
     "limit",
     "vault",
     "paths",
+    "update_links",
+    "offset",
+    "create_only",
+    "permanent",
+    "expected_modified",
 ] as const;
 
 /** Tools whose effect is hard to reverse — flagged for easy alerting. */
@@ -84,6 +89,8 @@ export function redactArgs(args: unknown): Record<string, unknown> {
     }
     if (typeof a.content === "string") out.content_len = Buffer.byteLength(a.content);
     if (typeof a.old_text === "string") out.old_text_len = Buffer.byteLength(a.old_text);
+    // Property values can hold note text; only the keys are logged.
+    if (a.properties && typeof a.properties === "object") out.properties = Object.keys(a.properties);
     // Search terms can quote note text, so only their size is logged.
     if (typeof a.query === "string") out.query_len = Buffer.byteLength(a.query);
     return out;

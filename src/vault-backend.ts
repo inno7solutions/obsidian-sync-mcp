@@ -28,10 +28,13 @@ export interface VaultBackend {
     readNote(path: string): Promise<string | null>;
     /** Bytes of a file, or only its size when larger than maxBytes; null if missing. */
     readBinary(path: string, maxBytes: number): Promise<{ size: number; bytes?: Uint8Array } | null>;
+    /** Modification time in ms, or null if the file doesn't exist. Metadata only. */
+    getMtime(path: string): Promise<number | null>;
     /** Paths whose file name equals `name` (case-insensitive), shortest path first. */
     findByName(name: string): Promise<string[]>;
     writeNote(path: string, content: string): Promise<boolean>;
     deleteNote(path: string): Promise<boolean>;
+    /** Move a note or attachment (binary content is preserved). */
     moveNote(from: string, to: string): Promise<boolean>;
     getMetadata(path: string): Promise<NoteInfo | null>;
     listNotes(folder?: string): Promise<string[]>;

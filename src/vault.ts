@@ -4,7 +4,7 @@
 
 import { DirectFileManipulator } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
 import type { DirectFileManipulatorOptions } from "../lib/livesync-commonlib/src/API/DirectFileManipulator.ts";
-import { createTextBlob, isTextDocument, readContent } from "../lib/livesync-commonlib/src/common/utils.ts";
+import { createBinaryBlob, createTextBlob, isTextDocument, readContent } from "../lib/livesync-commonlib/src/common/utils.ts";
 import type { FilePathWithPrefix } from "../lib/livesync-commonlib/src/common/types.ts";
 import type { MetaEntry } from "../lib/livesync-commonlib/src/API/DirectFileManipulatorV2.ts";
 import { isPathProbablyObfuscated, decrypt } from "octagonal-wheels/encryption/encryption";
@@ -245,6 +245,12 @@ export class Vault implements VaultBackend {
         return { size, bytes: typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content) };
     }
 
+    async getMtime(path: string): Promise<number | null> {
+        this.validatePath(path);
+        const meta = await this.manipulator.get(path as FilePathWithPrefix, true);
+        return meta && !(meta as any).deleted ? meta.mtime : null;
+    }
+
     async findByName(name: string): Promise<string[]> {
         const wanted = name.toLowerCase();
         const hits: string[] = [];
@@ -287,6 +293,15 @@ export class Vault implements VaultBackend {
     async moveNote(from: string, to: string): Promise<boolean> {
         this.validatePath(from);
         this.validatePath(to);
+        const meta = await this.manipulator.get(from as FilePathWithPrefix, true);
+        if (!meta) return false;
+        if (!isTextDocument(meta as any)) {
+            const file = await this.readBinary(from, Infinity);
+            if (!file?.bytes) return false;
+            clearHandlers();
+            const wrote = await this.manipulator.put(to, createBinaryBlob(new Uint8Array(file.bytes)), { ctime: meta.ctime, mtime: Date.now(), size: file.size }, "newnote");
+            return wrote ? await this.deleteNote(from) : false;
+        }
         const content = await this.readNote(from);
         if (content === null) return false;
         const wrote = await this.writeNote(to, content);
