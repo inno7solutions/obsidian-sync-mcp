@@ -76,17 +76,22 @@ caller has access to more than one vault; the error lists the choices.
 | Tool | Description |
 |---|---|
 | `list_vaults` | Vaults you can access, with your access level in each |
-| `read_note` | Read a note, text file or image (png/jpg/gif/webp, returned as an image, ≤3.75 MB). A bare name like `diagram.png` or `Meeting` resolves like an Obsidian link |
+| `read_note` | Read a note, text file or image (png/jpg/gif/webp, returned as an image, ≤3.75 MB), with its `modified` time. `.md` is optional; a bare name like `diagram.png` or `Meeting` resolves like an Obsidian link |
 | `read_notes` | Read up to 20 notes in one call; missing ones are flagged inline, images are left to `read_note` |
 | `search_notes` | Full-text search over paths and contents (every word must match), with snippets; attachments match by file name |
-| `write_note` | Create or overwrite a note (replaces entire content) |
-| `edit_note` | Edit a note without rewriting it — append, prepend (after frontmatter), or replace exact text |
+| `write_note` | Create or overwrite a note. `create_only` refuses to overwrite; `expected_modified` refuses if the note changed since it was read |
+| `edit_note` | Edit a note without rewriting it — append, prepend (after frontmatter), or replace exact text; takes `expected_modified` |
+| `set_properties` | Set or remove frontmatter properties; comments, other keys and the body are kept |
 | `list_folders` | List all folders in the vault with note and attachment counts |
 | `list_tags` | List all tags in the vault with counts |
-| `list_notes` | List notes with timestamps. Filter by folder, name, tag, or date. Sort by name or modified. `include_attachments` adds attachments with their size |
-| `delete_note` | Delete a note |
-| `move_note` | Move or rename a note — both ends must be writable; never overwrites an existing note |
+| `list_notes` | List notes with timestamps. Filter by folder, name, tag, or date. Sort by name or modified. `include_attachments` adds attachments with their size; `offset` pages past 100 |
+| `delete_note` | Move a note or attachment to `_trash/` (restore with `move_note`); `permanent` deletes for good |
+| `move_note` | Move or rename a note or attachment — both ends must be writable; never overwrites an existing note. `update_links` rewrites `[[links]]`, embeds and markdown links in other notes, like Obsidian |
 | `get_note_metadata` | Frontmatter, tags, outgoing links, backlinks, size, and timestamps; for an attachment, the notes that embed it |
+
+Paths without an extension get `.md`. Errors (not found, access denied, a changed note) come back as MCP
+`isError` results; "not found" suggests close paths. Listings and search skip `_trash/` and dot folders unless
+you name the folder.
 
 Every response includes an [Obsidian deep link](https://help.obsidian.md/Extending+Obsidian/Obsidian+URI)
 built from the vault's *Obsidian vault name*.
@@ -166,7 +171,10 @@ as confidential.
 - **No conflict resolution.** If an agent and Obsidian edit the same note simultaneously, last write wins.
 - **Search is substring-based.** No stemming or ranking beyond match counts; each query scans the
   vault's notes in memory. For unencrypted vaults the index file in `DATA_DIR` holds note text in plain form.
-- **Moves don't update links.** `[[links]]` in other notes keep pointing at the old path.
+- **Trash is a visible folder.** Deleted notes go to `_trash/`, not Obsidian's `.trash`: LiveSync never syncs
+  dot folders, so `_trash/` is what every device sees. Empty it with `delete_note` on its contents.
+- **Link updates are opt-in.** `move_note` rewrites links only with `update_links`, only in notes the caller may
+  write, and not inside code fences or relative markdown links (`../x.md`).
 - **Attachments are read-only.** They can be listed and found by name, and images read with `read_note`;
   other binary files (PDF, audio) cannot be read, and writing or moving attachments is not supported.
 - **Node 22+ required.**

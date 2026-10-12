@@ -1,9 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { UserError } from "fastmcp";
 import { registerTools } from "./tools.js";
 import { makeAuditLogger } from "./audit.js";
 import { makeResolver } from "./mcp-access.js";
 import { buildSnapshot, hashToken } from "./registry/model.js";
+
+/** A tool's reply as the model sees it: UserError (an isError result) becomes its message. */
+async function run<T>(p: Promise<T>): Promise<T | string> {
+    try {
+        return await p;
+    } catch (err) {
+        if (err instanceof UserError) return err.message;
+        throw err;
+    }
+}
 
 /** Minimal stand-in for FastMCP that just captures registered tools. */
 function stubServer() {
@@ -41,6 +52,9 @@ function stubVault(name: string) {
         async getMetadata() {
             return null;
         },
+        async getMtime(path: string) {
+            return ["Inbox/existing.md", "Inbox/a.md"].includes(path) ? 1000 : null;
+        },
         async readBinary(path: string) {
             if (path === "img/pic.png") return { size: PNG.length, bytes: PNG };
             if (path === "big.png") return { size: 9_000_000 };
@@ -66,6 +80,10 @@ const searchIndex = {
     listWithMtime: () => [],
     listPaths: () => [],
     listFiles: () => [],
+    allPaths: () => ["Inbox/existing.md"],
+    setFile() {},
+    building: false,
+    size: 0,
     getTags: () => [],
     listAllTags: () => [],
     getBacklinks: () => [],
@@ -85,8 +103,8 @@ function setup(docs: unknown[]) {
     const audit = makeAuditLogger({ enabled: true, sink: (l) => auditLines.push(l) });
     const resolver = makeResolver(() => snapshot, async (slug) => ({ vault: vaults[slug] as any, index: searchIndex }));
     registerTools(server as any, resolver, audit);
-    const call = (tool: string, args: Record<string, unknown>, tok: string) =>
-        server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken(tok), identity: { sub: "x" } } });
+    const call = (tool: string, args: Record<string, unknown>, tok: string): Promise<any> =>
+        run(server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken(tok), identity: { sub: "x" } } }));
     return { server, vaults, auditLines, call, setDocs: (d: unknown[]) => (snapshot = buildSnapshot(d)) };
 }
 
@@ -246,8 +264,8 @@ test("read_notes keeps images and binary files out of the batch", async () => {
 
 test("a connection pinned to one vault sees and reaches only that vault", async () => {
     const { server, vaults } = setup(DOCS);
-    const pinned = (tool: string, args: Record<string, unknown>) =>
-        server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken("tok-alice"), identity: { sub: "x" }, vault: "a" } });
+    const pinned = (tool: string, args: Record<string, unknown>): Promise<any> =>
+        run(server.tools.get(tool).execute(args, { session: { authenticated: true, tokenHash: hashToken("tok-alice"), identity: { sub: "x" }, vault: "a" } }));
     const list = await pinned("list_vaults", {});
     assert.match(list, /- a — A/);
     assert.doesNotMatch(list, /- b/);
@@ -286,4 +304,44 @@ test("list_notes and list_folders include attachments on request", async () => {
     } finally {
         Object.assign(searchIndex, saved);
     }
+});
+
+test("move_note update_links rewrites writable linking notes and lists the rest", async () => {
+    const { SearchIndex } = await import("./search.js");
+    const files = new Map<string, string>([
+        ["Inbox/a.md", "self link [[a]]"],
+        ["Inbox/x.md", "see [[a#Intro]] and [b](Inbox/a.md)"],
+        ["Projects/y.md", "also [[Inbox/a|A]]"],
+        ["Inbox/z.md", "mentions a but no link"],
+    ]);
+    const index = new SearchIndex();
+    for (const [p, c] of files) index.update(p, c, 0);
+    const mem = {
+        async readNote(p: string) {
+            return files.get(p) ?? null;
+        },
+        async getMtime(p: string) {
+            return files.has(p) ? 1 : null;
+        },
+        async writeNote(p: string, c: string) {
+            files.set(p, c);
+            return true;
+        },
+        async moveNote(f: string, t: string) {
+            files.set(t, files.get(f)!);
+            files.delete(f);
+            return true;
+        },
+    };
+    const server = stubServer();
+    registerTools(server as any, makeResolver(() => buildSnapshot(DOCS), async () => ({ vault: mem as any, index })));
+    const out = await run(server.tools
+        .get("move_note")
+        .execute({ from: "Inbox/a.md", to: "Inbox/b.md", update_links: true }, { session: { authenticated: true, tokenHash: hashToken("tok-bob"), identity: { sub: "x" } } }));
+    assert.match(out as string, /Updated 3 links in 2 notes: Inbox\/b.md, Inbox\/x.md\./);
+    assert.match(out as string, /Not updated \(no write access or write failed\): Projects\/y.md\./);
+    assert.equal(files.get("Inbox/x.md"), "see [[b#Intro]] and [b](Inbox/b.md)");
+    assert.equal(files.get("Inbox/b.md"), "self link [[b]]");
+    assert.equal(files.get("Projects/y.md"), "also [[Inbox/a|A]]");
+    assert.equal(files.get("Inbox/z.md"), "mentions a but no link");
 });

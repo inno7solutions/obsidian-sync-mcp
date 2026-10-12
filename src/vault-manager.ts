@@ -89,7 +89,10 @@ export class VaultManager {
         await vault.init();
         const index = new SearchIndex(join(this.cfg.dataDir, v.slug, "search-index.json"), passphrase);
         await index.loadFromDisk();
-        catchUpIndex(v.slug, vault, index).catch((err) => console.error(`Index rebuild for '${v.slug}' failed:`, err));
+        index.building = true;
+        catchUpIndex(v.slug, vault, index)
+            .catch((err) => console.error(`Index rebuild for '${v.slug}' failed:`, err))
+            .finally(() => (index.building = false));
         vault.watchChanges(
             (path, content, mtime, seq) => {
                 if (debugLogging) console.log(`[debug] ${v.slug}: ${content === null ? "delete" : "change"} ${path}`);
