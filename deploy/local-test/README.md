@@ -15,7 +15,7 @@ All ports bind to `127.0.0.1` only.
 ```sh
 # once, from the repo root (Docker Desktop running)
 git submodule update --init --recursive
-cp deploy/local-test/.env.example deploy/local-test/.env   # fill in secrets
+npm run env:init -- local-test   # writes deploy/local-test/.env with random secrets
 
 # every change
 npm run build

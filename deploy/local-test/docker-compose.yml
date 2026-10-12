@@ -10,7 +10,7 @@
 #   1. Start Docker Desktop.
 #   2. git submodule update --init --recursive     # pulls lib/livesync-commonlib
 #   3. npm ci && npm run build                      # produces ./dist (the image copies it)
-#   4. cp deploy/local-test/.env.example deploy/local-test/.env  and fill it in
+#   4. npm run env:init -- local-test    # writes .env with random secrets
 #
 # Then:
 #   docker compose -f deploy/local-test/docker-compose.yml --env-file deploy/local-test/.env up --build -d
